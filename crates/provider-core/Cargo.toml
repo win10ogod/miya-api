@@ -1,0 +1,12 @@
+[package]
+name = "provider-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-protocol.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true

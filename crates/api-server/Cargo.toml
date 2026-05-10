@@ -1,0 +1,28 @@
+[package]
+name = "api-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-kernel.workspace = true
+agent-protocol.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+context-store.workspace = true
+futures.workspace = true
+hex.workspace = true
+provider-anthropic.workspace = true
+provider-core.workspace = true
+provider-openai.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

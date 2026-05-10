@@ -1,0 +1,18 @@
+/target/
+/.multi-agent-context/
+/.env
+/.env.*
+
+# Local reference checkouts and third-party SDK snapshots used during development.
+/參考/
+
+# Local planning artifacts generated during development.
+/docs/superpowers/
+
+# Editor and OS files.
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
