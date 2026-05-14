@@ -47,6 +47,7 @@ dependencies = [
  "futures",
  "hex",
  "provider-core",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1127,6 +1128,7 @@ dependencies = [
  "async-trait",
  "futures",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

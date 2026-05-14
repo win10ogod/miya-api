@@ -38,9 +38,9 @@ impl OpenAiProvider {
 
         let mut body = serde_json::json!({
             "model": request.model,
-            "messages": messages,
-            "temperature": 0.2
+            "messages": messages
         });
+        merge_provider_options(&mut body, &request.provider_options);
 
         match effective_thinking_format(request) {
             ThinkingFormat::QwenDashScope => {
@@ -58,9 +58,12 @@ impl OpenAiProvider {
 
         if request.tool_results.is_empty() && !request.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(
-                request.tools.iter().map(openai_tool_definition).collect(),
+                openai_tools_for_request(request)
+                    .into_iter()
+                    .map(openai_tool_definition)
+                    .collect(),
             );
-            body["tool_choice"] = openai_tool_choice(&request.tool_choice);
+            body["tool_choice"] = openai_tool_choice_for_request(request);
             if let Some(parallel_tool_calls) = request.parallel_tool_calls {
                 body["parallel_tool_calls"] = serde_json::Value::Bool(parallel_tool_calls);
             }
@@ -138,6 +141,13 @@ impl OpenAiProvider {
             response.artifacts.push(artifact);
         }
 
+        response.usage = value
+            .get("usage")
+            .and_then(|usage| {
+                serde_json::from_value::<provider_core::ProviderUsage>(usage.clone()).ok()
+            })
+            .unwrap_or_default();
+
         Ok(response)
     }
 }
@@ -158,7 +168,7 @@ fn format_system_prompt(
         )
     };
     let prompt = format!(
-        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details.{user_instructions}"
+        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details. Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections.{user_instructions}"
     );
     if thinking_enabled && thinking_format == &ThinkingFormat::GemmaSystemToken {
         format!("<|think|>\n{prompt}")
@@ -169,8 +179,7 @@ fn format_system_prompt(
 
 fn effective_thinking_format(request: &ProviderRequest) -> ThinkingFormat {
     if request.thinking_format == ThinkingFormat::Auto {
-        let model = request.model.to_lowercase();
-        if model.contains("gemma") {
+        if is_gemma_generation_model(&request.model) {
             ThinkingFormat::GemmaSystemToken
         } else {
             ThinkingFormat::QwenChatTemplate
@@ -180,22 +189,83 @@ fn effective_thinking_format(request: &ProviderRequest) -> ThinkingFormat {
     }
 }
 
+fn merge_provider_options(body: &mut serde_json::Value, options: &serde_json::Value) {
+    let (Some(body), Some(options)) = (body.as_object_mut(), options.as_object()) else {
+        return;
+    };
+    for (key, value) in options {
+        if !value.is_null() && !is_openai_core_field(key) {
+            body.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn is_openai_core_field(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "messages"
+            | "tools"
+            | "tool_choice"
+            | "parallel_tool_calls"
+            | "stream"
+            | "functions"
+            | "function_call"
+    )
+}
+
+fn is_gemma_generation_model(model: &str) -> bool {
+    let configured_lists = [
+        "MIYA_GEMMA_MODELS",
+        "MULTI_AGENT_GEMMA_MODELS",
+        "GEMMA_MODELS",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok());
+    is_gemma_generation_model_with_config(model, configured_lists)
+}
+
+fn is_gemma_generation_model_with_config<I, S>(model: &str, configured_lists: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let normalized = normalize_model_id(model);
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized.contains("gemma")
+        || configured_lists
+            .into_iter()
+            .any(|raw| configured_model_list_contains(raw.as_ref(), &normalized))
+}
+
+fn configured_model_list_contains(raw: &str, normalized_model: &str) -> bool {
+    raw.split(',')
+        .map(normalize_model_id)
+        .any(|configured| configured == normalized_model)
+}
+
+fn normalize_model_id(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
     async fn invoke(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let scope = request.scope.clone();
         let task_id = request.task.task_id.clone();
         let body = Self::build_request_body(&request);
-        let value = self
+        let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?
+            .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+        let value = json_or_error(response, "OpenAI chat completion")
+            .await?
             .json::<serde_json::Value>()
             .await
             .map_err(|error| ProviderError::Rejected(error.to_string()))?;
@@ -212,12 +282,30 @@ impl ModelProvider for OpenAiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?
-            .error_for_status()
             .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+        let response = json_or_error(response, "OpenAI chat completion stream").await?;
 
         Ok(openai_sse_provider_stream(response))
     }
+}
+
+async fn json_or_error(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<reqwest::Response, ProviderError> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let status = response.status();
+    let url = response.url().to_string();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+    Err(ProviderError::Rejected(format!(
+        "{context} failed: HTTP {status} for {url}; body: {body}"
+    )))
 }
 
 type UpstreamByteStream =
@@ -327,7 +415,7 @@ fn openai_stream_events_from_chunk(
             && !text.is_empty()
         {
             events.push(Ok(ProviderStreamEvent::TextDelta {
-                text: strip_thinking_markup(text).to_string(),
+                text: strip_thinking_markup(text),
             }));
         }
 
@@ -616,12 +704,66 @@ fn openai_tool_definition(tool: &ToolDefinition) -> serde_json::Value {
             serde_json::Value::String(description.clone()),
         );
     }
-    function.insert("parameters".to_string(), tool.input_schema.clone());
+    function.insert(
+        "parameters".to_string(),
+        normalized_openai_tool_parameters(&tool.input_schema),
+    );
 
     serde_json::json!({
         "type": "function",
         "function": function
     })
+}
+
+fn normalized_openai_tool_parameters(input_schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = input_schema.clone();
+    if !schema.is_object() {
+        schema = serde_json::json!({});
+    }
+
+    let object = schema.as_object_mut().expect("schema object");
+    object
+        .entry("type".to_string())
+        .or_insert_with(|| serde_json::Value::String("object".to_string()));
+    object
+        .entry("properties".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+
+    if !object
+        .get("properties")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        object.insert("properties".to_string(), serde_json::json!({}));
+    }
+
+    schema
+}
+
+fn openai_tools_for_request(request: &ProviderRequest) -> Vec<&ToolDefinition> {
+    if should_adapt_named_tool_choice_for_local_backend(request)
+        && let ToolChoice::Named { name } = &request.tool_choice
+    {
+        return request
+            .tools
+            .iter()
+            .filter(|tool| tool.name == *name)
+            .collect();
+    }
+
+    request.tools.iter().collect()
+}
+
+fn openai_tool_choice_for_request(request: &ProviderRequest) -> serde_json::Value {
+    if should_adapt_named_tool_choice_for_local_backend(request) {
+        return serde_json::Value::String("required".to_string());
+    }
+
+    openai_tool_choice(&request.tool_choice)
+}
+
+fn should_adapt_named_tool_choice_for_local_backend(request: &ProviderRequest) -> bool {
+    is_gemma_generation_model(&request.model)
+        && matches!(request.tool_choice, ToolChoice::Named { .. })
 }
 
 fn openai_tool_choice(choice: &ToolChoice) -> serde_json::Value {
@@ -685,18 +827,46 @@ fn parse_structured_or_text(
     Some(AgentArtifact::Text {
         id: ArtifactId::from(format!("text-{}", task_id.as_ref())),
         scope: scope.clone(),
-        text: strip_thinking_markup(content).to_string(),
+        text: strip_thinking_markup(content),
     })
 }
 
-fn strip_thinking_markup(content: &str) -> &str {
+fn strip_thinking_markup(content: &str) -> String {
     if let Some((_, after)) = content.rsplit_once("<channel|>") {
-        return after.trim();
+        return strip_generation_wrappers(after);
     }
     if let Some((_, after)) = content.rsplit_once("</think>") {
-        return after.trim();
+        return strip_generation_wrappers(after);
     }
-    content
+    strip_generation_wrappers(content)
+}
+
+fn strip_generation_wrappers(content: &str) -> String {
+    let mut text = content.trim().to_string();
+
+    for marker in ["<start_of_turn>model", "<start_of_turn>assistant"] {
+        if let Some((_, after)) = text.rsplit_once(marker) {
+            text = after.to_string();
+            break;
+        }
+    }
+
+    if let Some((before, _)) = text.split_once("<end_of_turn>") {
+        text = before.to_string();
+    }
+
+    for token in [
+        "<bos>",
+        "<eos>",
+        "<start_of_turn>",
+        "<end_of_turn>",
+        "<|start_of_turn|>",
+        "<|end_of_turn|>",
+    ] {
+        text = text.replace(token, "");
+    }
+
+    text.trim().to_string()
 }
 
 fn extract_final_answer_from_reasoning(reasoning: &str) -> Option<String> {
@@ -912,6 +1082,76 @@ mod tests {
     }
 
     #[test]
+    fn openai_payload_preserves_model_provider_options() {
+        let mut request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+        request.provider_options = serde_json::json!({
+            "temperature": 0.9,
+            "top_p": 0.4,
+            "max_completion_tokens": 321,
+            "response_format": {"type": "json_object"},
+            "seed": 42,
+            "metadata": {"foo": "bar"}
+        });
+
+        let body = OpenAiProvider::build_request_body(&request);
+
+        assert_eq!(body["temperature"], 0.9);
+        assert_eq!(body["top_p"], 0.4);
+        assert_eq!(body["max_completion_tokens"], 321);
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({"type": "json_object"})
+        );
+        assert_eq!(body["seed"], 42);
+        assert_eq!(body["metadata"], serde_json::json!({"foo": "bar"}));
+    }
+
+    #[test]
+    fn openai_payload_does_not_force_sampling_when_unconfigured() {
+        let request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+
+        let body = OpenAiProvider::build_request_body(&request);
+
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn openai_payload_adapts_named_tool_choice_for_gemma_backend() {
+        let mut request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+        request.model = "local-gemma-finetune".to_string();
+        request.tools = vec![
+            ToolDefinition {
+                name: "lookup_weather".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "lookup_news".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        request.tool_choice = ToolChoice::Named {
+            name: "lookup_weather".to_string(),
+        };
+
+        let body = OpenAiProvider::build_request_body(&request);
+
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["tools"][0]["function"]["name"],
+            serde_json::Value::String("lookup_weather".to_string())
+        );
+    }
+
+    #[test]
     fn openai_payload_can_disable_tool_use_with_tool_choice_none() {
         let mut request = provider_request_with_media(MediaSource::DataUrl {
             data_url: "data:image/png;base64,AAAA".to_string(),
@@ -927,6 +1167,28 @@ mod tests {
 
         assert_eq!(body["tool_choice"], "none");
         assert!(body["tools"].is_array());
+    }
+
+    #[test]
+    fn openai_payload_adds_missing_tool_parameter_properties_for_local_backend() {
+        let mut request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+        request.tools = vec![ToolDefinition {
+            name: "lookup_weather".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let body = OpenAiProvider::build_request_body(&request);
+
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        );
     }
 
     #[test]
@@ -1028,6 +1290,21 @@ mod tests {
     }
 
     #[test]
+    fn openai_payload_instructs_model_to_preserve_structured_formatting() {
+        let request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+
+        let body = OpenAiProvider::build_request_body(&request);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+
+        assert!(system.contains("Preserve formatting exactly"));
+        assert!(system.contains("Do not minify"));
+        assert!(system.contains("XML/HTML-like tags"));
+        assert!(system.contains("Markdown"));
+    }
+
+    #[test]
     fn openai_payload_disables_qwen_thinking_when_supported() {
         let request = provider_request_with_media(MediaSource::DataUrl {
             data_url: "data:image/png;base64,AAAA".to_string(),
@@ -1070,6 +1347,26 @@ mod tests {
     }
 
     #[test]
+    fn openai_payload_uses_gemma_format_for_gemma_named_model() {
+        let mut request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+        request.model = "local-gemma-finetune".to_string();
+        request.thinking_enabled = true;
+        request.thinking_format = ThinkingFormat::Auto;
+
+        let body = OpenAiProvider::build_request_body(&request);
+
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("<|think|>")
+        );
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
     fn openai_response_strips_gemma_thought_channel() {
         let scope = IsolationKey::new("tenant", "request", "conversation");
         let task_id = TaskId::from("root");
@@ -1090,6 +1387,65 @@ mod tests {
             panic!("expected text artifact");
         };
         assert_eq!(text, "Final answer");
+    }
+
+    #[test]
+    fn openai_response_strips_gemma_generation_wrappers() {
+        let scope = IsolationKey::new("tenant", "request", "conversation");
+        let task_id = TaskId::from("root");
+        let response = OpenAiProvider::parse_response(
+            &scope,
+            &task_id,
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "<bos><start_of_turn>model\n可直接給使用者的答案。<end_of_turn><eos>"
+                    }
+                }]
+            }),
+        )
+        .unwrap();
+
+        let AgentArtifact::Text { text, .. } = &response.artifacts[0] else {
+            panic!("expected text artifact");
+        };
+        assert_eq!(text, "可直接給使用者的答案。");
+    }
+
+    #[test]
+    fn gemma_generation_model_can_be_selected_by_configuration() {
+        assert!(is_gemma_generation_model_with_config(
+            "configured-local-alias",
+            ["configured-local-alias"]
+        ));
+        assert!(!is_gemma_generation_model_with_config(
+            "configured-local-alias",
+            ["other-model"]
+        ));
+    }
+
+    #[test]
+    fn openai_response_maps_prompt_and_completion_usage() {
+        let scope = IsolationKey::new("tenant", "request", "conversation");
+        let task_id = TaskId::from("root");
+        let response = OpenAiProvider::parse_response(
+            &scope,
+            &task_id,
+            serde_json::json!({
+                "choices": [{
+                    "message": {"content": "Final answer"}
+                }],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(response.usage.input_tokens, 11);
+        assert_eq!(response.usage.output_tokens, 7);
     }
 
     #[test]
@@ -1228,6 +1584,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
             tool_results: vec![],
+            provider_options: serde_json::json!({}),
         }
     }
 }

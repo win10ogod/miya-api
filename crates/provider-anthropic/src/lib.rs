@@ -74,6 +74,7 @@ impl AnthropicProvider {
             }
         }
 
+        merge_provider_options(&mut body, &request.provider_options);
         body
     }
 
@@ -138,6 +139,13 @@ impl AnthropicProvider {
             }
         }
 
+        response.usage = value
+            .get("usage")
+            .and_then(|usage| {
+                serde_json::from_value::<provider_core::ProviderUsage>(usage.clone()).ok()
+            })
+            .unwrap_or_default();
+
         Ok(response)
     }
 }
@@ -147,6 +155,24 @@ fn anthropic_thinking_config() -> serde_json::Value {
         "type": "enabled",
         "budget_tokens": 1024
     })
+}
+
+fn merge_provider_options(body: &mut serde_json::Value, options: &serde_json::Value) {
+    let (Some(body), Some(options)) = (body.as_object_mut(), options.as_object()) else {
+        return;
+    };
+    for (key, value) in options {
+        if !value.is_null() && !is_anthropic_core_field(key) {
+            body.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn is_anthropic_core_field(key: &str) -> bool {
+    matches!(
+        key,
+        "model" | "system" | "messages" | "tools" | "tool_choice" | "stream"
+    )
 }
 
 fn format_system_prompt(
@@ -163,7 +189,7 @@ fn format_system_prompt(
         )
     };
     format!(
-        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details.{user_instructions}"
+        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details. Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections.{user_instructions}"
     )
 }
 
@@ -380,13 +406,14 @@ fn anthropic_message_delta_stream_event(
         .and_then(|reason| reason.as_str())
         .map(anthropic_provider_finish_reason)
         .unwrap_or(ProviderFinishReason::Stop);
-    let mut events = vec![Ok(ProviderStreamEvent::Finish { reason })];
+    let mut events = Vec::new();
 
     if let Some(usage) = value.get("usage").and_then(|usage| {
         serde_json::from_value::<provider_core::ProviderUsage>(usage.clone()).ok()
     }) {
         events.push(Ok(ProviderStreamEvent::Usage { usage }));
     }
+    events.push(Ok(ProviderStreamEvent::Finish { reason }));
 
     events
 }
@@ -725,6 +752,27 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_response_preserves_usage() {
+        let scope = IsolationKey::new("tenant", "request", "conversation");
+        let task_id = TaskId::from("root");
+        let response = AnthropicProvider::parse_response(
+            &scope,
+            &task_id,
+            serde_json::json!({
+                "content": [{"type": "text", "text": "Final answer"}],
+                "usage": {
+                    "input_tokens": 13,
+                    "output_tokens": 8
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(response.usage.input_tokens, 13);
+        assert_eq!(response.usage.output_tokens, 8);
+    }
+
+    #[test]
     fn anthropic_payload_exposes_tools_to_main_agent() {
         let mut request = provider_request_with_media(MediaSource::Base64 {
             data: "AAAA".to_string(),
@@ -787,6 +835,28 @@ mod tests {
 
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "lookup_weather");
+    }
+
+    #[test]
+    fn anthropic_payload_preserves_model_provider_options() {
+        let mut request = provider_request_with_media(MediaSource::Base64 {
+            data: "AAAA".to_string(),
+        });
+        request.provider_options = serde_json::json!({
+            "max_tokens": 777,
+            "temperature": 0.8,
+            "top_p": 0.5,
+            "stop_sequences": ["END"],
+            "metadata": {"user_id": "user-a"}
+        });
+
+        let body = AnthropicProvider::build_request_body(&request);
+
+        assert_eq!(body["max_tokens"], 777);
+        assert_eq!(body["temperature"], 0.8);
+        assert_eq!(body["top_p"], 0.5);
+        assert_eq!(body["stop_sequences"], serde_json::json!(["END"]));
+        assert_eq!(body["metadata"], serde_json::json!({"user_id": "user-a"}));
     }
 
     #[test]
@@ -998,6 +1068,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
             tool_results: vec![],
+            provider_options: serde_json::json!({}),
         }
     }
 }

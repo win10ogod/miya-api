@@ -1,6 +1,6 @@
 # Miya API
 
-Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messages 相容多代理 API 閘道。API 使用者仍然只送出一次標準相容請求；後端會依 `reasoning.effort` 以 deterministic orchestration 將任務拆解為有界子任務，並行派發給子代理，最後由 synthesizer 彙整為單一可用答案。
+Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messages 相容多代理 API 閘道。API 使用者仍然只送出一次標準相容請求；後端會依 `reasoning.effort` 以 deterministic orchestration 將任務拆解為有界子任務，並行派發給子代理，最後由 synthesizer 彙整為單一可用答案。對前端來說它仍然像單一 OpenAI/Anthropic 相容 API；對後端來說它是可控的多請求 fan-out、上下文快取、工具帳本與最終合成管線。
 
 本專案的目標不是做「多個 chatbot 互聊」的展示型 agent playground，而是提供可商用 API 所需要的核心行為：
 
@@ -14,17 +14,28 @@ Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messa
 - multimodal image input
 - OpenAI/Anthropic tool-call 相容輸出
 - true provider token streaming for direct/root streaming paths
+- structured usage telemetry with output-token accounting
+- bounded concurrent provider calls, default 4-way child-agent fan-out
 - optional encrypted sub-agent state disclosure
 - SurrealKV-backed rewindable long-context store and context-pack cache
+- header/metadata-based multi-tenant isolation
 
 ## Status
 
-目前這是一個可執行的 Rust workspace，包含完整 API server、provider abstraction、OpenAI/Anthropic provider adapters、bounded multi-agent kernel、SurrealKV context store 與測試覆蓋。它已經可以接 OpenAI-compatible 或 Anthropic-compatible 後端，例如本機 `http://localhost:8000/v1`。
+目前這是一個可執行的 Rust workspace，包含完整 API server、provider abstraction、OpenAI/Anthropic provider adapters、bounded multi-agent kernel、SurrealKV context store 與測試覆蓋。它已經可以接 OpenAI-compatible 或 Anthropic-compatible 後端，例如本機 `http://localhost:8000/v1`、LM Studio/Ollama/vLLM 類 OpenAI-compatible endpoint，或真正的 Anthropic-compatible endpoint。
+
+商用部署時的核心邊界是：
+
+- Client compatibility: 前端仍使用標準 `/v1/chat/completions`、`/v1/messages`、stream、batch、tool-call 格式。
+- Provider efficiency: 子代理會以有界並行向同一後端發送多個標準 provider request，預設最多 4 個 child-agent request 同時在飛。
+- Isolation: tenant、request、conversation、artifact、tool-call、context cache key 都有明確隔離，避免批量請求或多用戶場景串話。
+- Cache discipline: context-pack cache 依 tenant/context/revision/retrieval policy/model/tools/thinking/provider options/system hash 切分，避免不同後端格式、模型或工具 schema 共用錯誤上下文。
+- Observability: stdout JSONL telemetry 記錄 provider call count、child agent count、工具數、token usage、context cache hit/miss；可選 training trace 記錄輸入輸出與中間 artifact。
 
 仍需注意：
 
 - 伺服器只代理或編排模型呼叫，不會在後端任意執行使用者定義工具。工具呼叫會以 OpenAI/Anthropic 相容格式回給前端，由前端或客戶端執行工具後再把 tool result 送回。
-- 高推理難度會增加可用 agent budget 與 deterministic coverage，但最終答案品質仍取決於上游模型是否遵守結構化 spawn/synthesis 指令。
+- 高推理難度會增加可用 agent coverage 與 deterministic fan-out；token 用量會被記錄為 telemetry，不會作為阻止子代理生成的條件。
 - full multi-agent orchestration 的 streaming 會在完成 orchestration 後輸出相容 SSE；只有 `reasoning.effort=none` 與不需完整 orchestration 的 root path 會直接轉發 provider token streaming。
 
 ## Architecture
@@ -41,6 +52,7 @@ api-server
 agent-kernel
   |
   | leader -> bounded spawn plan -> parallel child agents -> synthesizer
+  |                                      \-> reasoning-summary agent (public thought summary only)
   v
 provider-core
   |
@@ -68,15 +80,17 @@ crates/
 2. `api-server` parses it into `NormalizedRequest`.
 3. Images become scoped `MediaArtifact` records.
 4. Tool definitions and tool results become structured protocol records.
-5. `reasoning.effort` selects the agent budget.
+5. `reasoning.effort` selects the agent coverage tier.
 6. The leader/root agent receives preserved user system instructions plus an orchestration policy.
 7. The leader may emit a structured `SpawnPlan`.
-8. The kernel validates spawn depth, total agent count, artifact scope and budgets.
-9. Child agents run in parallel through `join_all`.
+8. The kernel validates spawn depth, total agent count, artifact scope and tool-call budgets.
+9. Child agents run through a bounded concurrent fan-out queue; results are sorted back into deterministic task order before verification.
 10. Child outputs are stored as internal artifacts; their state is AES-256-GCM encrypted.
 11. Root-visible unresolved tool calls are returned to the user if tools are required.
-12. If no root tool call remains, a synthesizer returns one natural final answer.
-13. Optional context metadata records the exchange into SurrealKV.
+12. If public reasoning is enabled, one dedicated `reasoning-summary` agent summarizes worker outputs for the frontend reasoning field only.
+13. If no root tool call remains, a synthesizer reads the original worker artifacts and returns one natural final answer.
+14. Optional context metadata records the exchange into SurrealKV.
+15. The API emits a structured `api_usage` telemetry record for backend accounting.
 
 Internal child-agent reasoning, tool calls and raw outputs are not exposed by default. Only root-visible tool calls and the final synthesized answer are public unless the caller explicitly asks for encrypted sub-agent state.
 
@@ -86,10 +100,24 @@ Internal child-agent reasoning, tool calls and raw outputs are not exposed by de
 
 ```text
 GET  /health
+GET  /models
 GET  /v1/models
+GET  /v1/v1/models
+POST /completions
+POST /v1/completions
+POST /v1/v1/completions
+POST /chat/completions
 POST /v1/chat/completions
+POST /v1/v1/chat/completions
+POST /chat/completions/batch
 POST /v1/chat/completions/batch
+POST /v1/v1/chat/completions/batch
 ```
+
+Canonical OpenAI-compatible base URL is `/v1`. The root and double-`/v1` aliases exist for frontends that either omit `/v1` or append `/v1` themselves. In practice:
+
+- if a frontend asks for "OpenAI API URL" or "endpoint", use `http://localhost:3100/v1`;
+- if a frontend asks for "base URL" and appends `/v1` internally, use `http://localhost:3100`.
 
 Supported request features:
 
@@ -107,12 +135,24 @@ Supported request features:
 - `thinking`, `enable_thinking`, `preserve_thinking`, `chat_template_kwargs`
 - `reasoning.effort`
 - `metadata`
+- provider model options such as `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `response_format`, `seed`, `stop`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `modalities`, `audio`, `prediction`, `service_tier`, `stream_options`, `reasoning_effort`, `verbosity`, `user`, `safety_identifier`, and backend-specific extra fields
+
+Legacy OpenAI Completions compatibility:
+
+- `POST /v1/completions` accepts `prompt` requests from text-completion frontends such as SillyTavern `api_type: generic`.
+- The gateway converts `prompt` into an internal user message, so it can still use the same provider adapters, context store, reasoning effort, telemetry and cache isolation.
+- Responses use legacy `text_completion` shape with `choices[].text`; streaming emits text-completion SSE chunks and ends with `data: [DONE]`.
+- Completion model parameters such as `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logit_bias`, `logprobs`, `n`, and `best_of` are preserved as provider options.
 
 ### Anthropic-compatible endpoints
 
 ```text
+POST /messages
 POST /v1/messages
+POST /v1/v1/messages
+POST /messages/batch
 POST /v1/messages/batch
+POST /v1/v1/messages/batch
 ```
 
 Supported request features:
@@ -131,32 +171,170 @@ Supported request features:
 - `thinking`
 - `reasoning.effort`
 - `metadata`
+- provider model options such as `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `metadata`, service-tier/provider beta fields, and backend-specific extra fields
 
 Batch endpoints run items concurrently and preserve per-item response isolation. Batch size is capped at 64 requests.
 
+## Provider Parameter Pass-Through
+
+Miya API only consumes gateway/orchestration parameters. Model configuration parameters are preserved and forwarded to the configured backend provider so existing OpenAI Chat Completions and Anthropic Messages frontends keep working.
+
+Gateway-consumed parameters:
+
+| location | consumed by gateway |
+| --- | --- |
+| `reasoning.effort` | selects direct mode or multi-agent coverage tier: `none`, `low`, `medium`, `high`, `xhigh` |
+| `metadata.tenant_id`, tenant aliases | tenant isolation and per-tenant concurrency |
+| `metadata.request_id`, request aliases | request correlation and telemetry |
+| `metadata.conversation_id`, thread/session aliases | conversation fingerprint and scoped artifacts |
+| `metadata.context` | SurrealKV long-context assembly and append policy |
+| `metadata.agent`, `metadata.orchestration`, `metadata.max_parallel_agents`, `metadata.parallel_agents` | per-request child-agent concurrency |
+| `metadata.thinking_mode`, `metadata.thinking_format` | Qwen/Gemma thinking format adaptation |
+| `metadata.include_context_report`, `metadata.include_encrypted_subagent_state` | optional response-side diagnostics |
+
+### Effort Model Aliases
+
+Every non-mock model exposed by `MULTI_AGENT_MODELS` also gets effort-suffixed model aliases:
+
+| alias suffix | gateway effort | child-agent target |
+| --- | --- | --- |
+| `-none` | `none` | 0, direct provider passthrough |
+| `-low` | `low` | 4 |
+| `-medium` | `medium` | 16 |
+| `-high` | `high` | 32 |
+| `-xhigh` | `xhigh` | 64 |
+
+For example, if `MULTI_AGENT_MODELS=local-model,mock`, `/v1/models` exposes `local-model`, `local-model-none`, `local-model-low`, `local-model-medium`, `local-model-high`, `local-model-xhigh`, and `mock`.
+
+The alias is gateway-only. A request using `model: "local-model-high"` is sent to the backend as `model: "local-model"` while Miya uses `reasoning.effort=high`. The alias wins over conflicting request fields such as `reasoning.effort`, so frontends that cannot set custom reasoning fields can select the tier purely through the model name.
+
+Everything else is treated as provider configuration. For OpenAI-compatible requests, unknown top-level JSON fields are captured and merged into the upstream `/chat/completions` body after normalization. For Anthropic-compatible requests, unknown top-level JSON fields are captured and merged into the upstream `/messages` body. This includes both official model controls and OpenAI-compatible local-server extensions.
+
+Reserved transport/core fields cannot be overridden by pass-through because the gateway must own normalization and public response shape:
+
+| provider | reserved fields |
+| --- | --- |
+| OpenAI-compatible | `model`, `messages`, `tools`, `tool_choice`, `parallel_tool_calls`, `stream`, `functions`, `function_call` |
+| Anthropic-compatible | `model`, `system`, `messages`, `tools`, `tool_choice`, `stream` |
+
+`metadata` is handled specially: gateway-only keys are stripped before provider forwarding, but unrelated metadata keys are preserved. For example `metadata.foo` is forwarded, while `metadata.tenant_id` and `metadata.context` are not. `reasoning` is also handled specially: nested `reasoning.effort` is removed before forwarding because it controls Miya's agent coverage tier, while other nested reasoning provider options such as `reasoning.summary` are preserved. Top-level `reasoning_effort` is not consumed by Miya and is forwarded as a provider option.
+
+Example:
+
+```json
+{
+  "model": "local-model",
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "max_completion_tokens": 1024,
+  "response_format": { "type": "json_object" },
+  "stream_options": { "include_usage": true },
+  "reasoning_effort": "low",
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "metadata": {
+    "tenant_id": "tenant-a",
+    "context": { "id": "long-context-session-001", "cache": true },
+    "foo": "bar"
+  },
+  "messages": [
+    { "role": "user", "content": "Return JSON." }
+  ]
+}
+```
+
+The gateway uses `reasoning.effort=medium`, tenant/context metadata and cache policy. The provider still receives `temperature`, `top_p`, `max_completion_tokens`, `response_format`, `stream_options`, top-level `reasoning_effort`, `reasoning.summary`, and `metadata.foo`.
+
+## Multi-User Isolation
+
+The gateway scopes requests by tenant, request and conversation identity before entering the agent kernel:
+
+- `tenant_id` isolates artifacts, tool-call ledger records, encrypted sub-agent state and SurrealKV context/cache keys.
+- `request_id` keeps concurrent requests distinct even when they share a conversation.
+- `conversation_id` produces a stable conversation fingerprint for encryption AAD and scoped artifacts.
+
+Identity can be supplied through HTTP headers:
+
+| header | purpose |
+| --- | --- |
+| `x-tenant-id` | tenant/workspace isolation key |
+| `x-organization-id` | fallback tenant key |
+| `x-project-id` | fallback tenant key |
+| `x-user-id` | fallback tenant key |
+| `x-request-id` | caller trace/request id |
+| `x-correlation-id` | fallback request id |
+| `x-conversation-id` | stable conversation/thread id |
+| `x-thread-id` | fallback conversation id |
+
+The same identity can also be supplied per request through `metadata`, which is especially useful for batch calls:
+
+```json
+{
+  "model": "local-model",
+  "metadata": {
+    "tenant_id": "tenant-a",
+    "request_id": "req-2026-05-13-0001",
+    "conversation_id": "thread-7",
+    "context": {
+      "id": "shared-long-context",
+      "include_report": true
+    }
+  },
+  "messages": [{ "role": "user", "content": "Continue." }]
+}
+```
+
+`metadata` overrides headers, headers override the default tenant `default`. Unsafe or very long identity values are internally hashed into bounded ASCII components, so user-facing IDs can be accepted without becoming storage-key material. Batch items are normalized independently, so one batch may safely contain requests for multiple tenants.
+
+Production routers also apply a per-tenant concurrency limiter. `TENANT_MAX_CONCURRENT_REQUESTS` defaults to the medium tier, `16`, when the router is built from environment variables. Set it to `0` to disable the limiter. Requests beyond the same tenant's limit wait on that tenant's semaphore; other tenants continue running independently. This keeps one tenant's large batch or high-effort workload from monopolizing provider capacity.
+
 ## Reasoning Effort
 
-`reasoning.effort` controls whether the gateway runs direct provider mode or multi-agent orchestration, and how much parallel agent coverage the kernel allows.
+`reasoning.effort` controls whether the gateway runs direct provider mode or multi-agent orchestration, and how much child-agent coverage the kernel allows. Agent coverage and provider-call concurrency are intentionally separate: `medium` generates the 16-agent tier by default, while the default runtime only runs 4 child-agent backend calls at once so latency improves without unbounded provider pressure. Token usage is accounted and logged, not used as a stop condition for child-agent creation.
 
-| effort | behavior | max agents per request | target child agents |
-| --- | --- | ---: | ---: |
-| `none` | direct upstream request, no agent orchestration | 0 | 0 |
-| `low` | compact orchestration | 4 | 3 |
-| `medium` | compact orchestration, default | 4 | 3 |
-| `high` | broader decomposition and verification | 16 | 15 |
-| `xhigh` | maximum bounded decomposition | 32 | 31 |
+| effort | behavior | max agents per request | target child agents | default concurrent child calls |
+| --- | --- | ---: | ---: | ---: |
+| `none` | direct upstream request, no agent orchestration | 0 | 0 | 0 |
+| `low` | compact orchestration | 4 | 4 | 4 |
+| `medium` | broader orchestration, default | 16 | 16 | 4 |
+| `high` | deep decomposition and verification | 32 | 32 | 4 |
+| `xhigh` | maximum bounded decomposition | 64 | 64 | 4 |
+
+Concurrency can be configured globally through environment variables:
+
+```bash
+MULTI_AGENT_MAX_PARALLEL_AGENTS=4 cargo run -p api-server
+```
+
+The same limit can be overridden per request:
+
+```json
+{
+  "metadata": {
+    "agent": {
+      "max_parallel_agents": 2
+    }
+  }
+}
+```
+
+Valid per-request aliases are `metadata.max_parallel_agents`, `metadata.parallel_agents`, `metadata.agent.max_parallel_agents`, `metadata.agent.parallel_agents`, `metadata.agent.parallelism`, `metadata.orchestration.max_parallel_agents`, and `metadata.orchestration.parallel_agents`. The runtime clamps the value to `1..max_agents_per_request`; use `reasoning.effort=none` for 0-agent direct mode.
 
 The root agent receives an explicit orchestration policy in its system instructions:
 
 ```text
 reasoning_effort=<level>
 max_agents_per_request=<N>
-max_parallel_agents=<N>
-target_parallel_agents=<N-1>
+max_parallel_agents=<configured concurrency>
+target_parallel_agents=<N>
 max_spawn_depth=<N>
 max_total_tool_calls=<N>
-max_total_tokens=<N>
+token_accounting_reference=<N>
 ```
+
+The leader may spawn more child tasks than the concurrency limit. The kernel executes those children with bounded parallelism, sends multiple OpenAI/Anthropic-compatible provider calls in parallel, then restores deterministic task order before writing artifacts, accounting token/tool usage, sealing sub-agent state and invoking final synthesis.
 
 The test suite includes deterministic coverage evaluation proving that higher effort increases actual task coverage instead of only changing metadata:
 
@@ -211,9 +389,41 @@ When `thinking_format` is omitted:
 
 - model names containing `qwen` default to Qwen chat-template style.
 - model names containing `gemma` default to Gemma system-token style.
+- model IDs listed in `MIYA_GEMMA_MODELS`, `MULTI_AGENT_GEMMA_MODELS`, or `GEMMA_MODELS` default to Gemma system-token style. This is how local aliases such as `local-gemma-model` are mapped without hardcoding a model ID in the API kernel.
 - other models use provider auto behavior.
 
-The gateway strips provider reasoning/thinking blocks from public direct responses where possible, so hidden thinking does not leak into user-visible output.
+Public reasoning output is deployment controlled. The exposed reasoning is produced by one dedicated `reasoning-summary` agent from bounded worker artifacts; it is not raw provider hidden reasoning and it does not include child-agent private traces or child-agent tool-call payloads unless a separate encrypted-state diagnostic is explicitly requested. This summary agent is not part of final answer synthesis: the final synthesizer still receives the original worker artifacts, so a short public thought summary cannot compress or shorten the user-facing answer.
+
+| `MIYA_PUBLIC_REASONING` value | behavior |
+| --- | --- |
+| `always` | default; include the synthesized multi-agent reasoning summary for orchestrated responses even when the frontend did not ask |
+| `request` | include public reasoning only when the request asks for it through `include_reasoning`, `include_thinking`, `show_reasoning`, `return_reasoning`, `reasoning.summary`, or an enabled `thinking` block |
+| `never` or `strip` | suppress public reasoning even when the frontend asks; return only the final answer/tool-call surface |
+
+Aliases are also accepted through `MIYA_PUBLIC_REASONING_MODE`, `MULTI_AGENT_PUBLIC_REASONING`, or `PUBLIC_REASONING_MODE`. Truthy values such as `on` and `enabled` map to `always`; falsy values such as `off` and `disabled` map to `never`. If none of these environment variables are set, the gateway uses `always`.
+
+For OpenAI Chat Completions, public reasoning is returned as `message.reasoning_content` plus `message.reasoning.summary`, and streaming sends a reasoning delta before the final content delta. For Anthropic Messages, it is returned as a `thinking` content block or `thinking_delta` stream event. For legacy OpenAI Completions, Qwen-style models receive:
+
+```text
+<think>
+Multi-agent process summary...
+</think>
+
+Final answer...
+```
+
+Gemma-style models receive:
+
+```text
+<|channel>thought
+Multi-agent process summary...
+<channel|>
+Final answer...
+```
+
+The gateway strips provider reasoning/thinking blocks from public direct responses where possible, so hidden thinking does not leak into user-visible output. Direct mode with `reasoning.effort=none` has no multi-agent process to summarize.
+
+Final synthesis and provider worker prompts also instruct models to preserve structured output formatting. When an answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables or delimiter-separated blocks, the gateway asks the backend not to minify, collapse line breaks, remove heading spaces, or merge tag-delimited sections. After synthesis, the kernel applies a deterministic generic layout normalization pass that restores obvious line boundaries around XML-like tags, Markdown headings and repeated ASCII field labels without matching domain-specific tag names, characters, or sample text.
 
 ## Tool Calls
 
@@ -309,6 +519,7 @@ The normalizer assigns every image to a scoped `MediaArtifact` with SHA-256 hash
 - max chunk controls
 - context-pack cache
 - common-prefix reuse plus tail append
+- cache namespaces that isolate model/tool/thinking/system profiles
 
 Enable persistent context by passing `metadata.context`:
 
@@ -316,18 +527,31 @@ Enable persistent context by passing `metadata.context`:
 {
   "metadata": {
     "context": {
-      "id": "roleplay-session-001",
+      "id": "long-context-session-001",
       "query": "violet launch code",
       "max_context_bytes": 1048576,
       "max_chunks": 128,
       "recent_tail_chunks": 12,
       "cache": true,
+      "cache_namespace": "project-local-model-tools-v1",
       "append": true,
       "include_report": true
     }
   }
 }
 ```
+
+If `cache_namespace` is omitted, the server generates one from:
+
+- source format: OpenAI Chat Completions or Anthropic Messages
+- model name
+- thinking enabled/disabled flag
+- thinking format, such as `qwen_chat_template`, `qwen_dashscope`, or `gemma_system_token`
+- tool definitions, tool choice and `parallel_tool_calls` hash
+- provider model options hash, such as sampling, token-limit, response-format, stream-options or backend-specific fields
+- system prompt hash
+
+The generated namespace is part of the context-pack policy hash together with retrieval query, byte limit, chunk limit and recent-tail policy. This means the same tenant/context/revision can safely reuse cached common prefixes only when the relevant backend profile is the same. Different models, tools, system prompts, thinking formats or provider model options build independent context packs, avoiding cache pollution in multi-user and multi-backend deployments.
 
 Useful context fields:
 
@@ -340,10 +564,30 @@ Useful context fields:
 | `max_chunks` | max selected chunks, clamped to 128 |
 | `recent_tail_chunks` | always keep recent tail in candidate set |
 | `cache` | enable context-pack cache |
+| `cache_namespace` or `namespace` | manually isolate cache packs for a backend/profile; auto-generated when omitted |
 | `append` or `append_current` | append current request and final answer |
 | `include_report` | add `context_cache` report to response |
 
 Set `CONTEXT_STORE=disabled` to disable persistent context. By default the store path is `.multi-agent-context/surrealkv`.
+
+When `include_report` is true, responses include context accounting such as:
+
+```json
+{
+  "context_cache": {
+    "enabled": true,
+    "context_id": "long-context-session-001",
+    "cache_namespace": "openai_chat|model:local-model|thinking:on:gemma_system_token|tools:...|system:...",
+    "revision": 42,
+    "included_chunks": 12,
+    "included_bytes": 98304,
+    "cache_hit": true,
+    "base_cache_revision": 40,
+    "tail_chunks": 2,
+    "stored_revision": 44
+  }
+}
+```
 
 ## Encrypted Sub-agent State
 
@@ -406,6 +650,120 @@ OPENAI_API_KEY=local-key \
 cargo run -p api-server
 ```
 
+Windows deployment for a local Gemma-format fine-tune:
+
+```powershell
+.\scripts\windows\start-miya-api.ps1 `
+  -BindAddr "127.0.0.1:3100" `
+  -OpenAIBaseUrl "http://YOUR_BACKEND_HOST:PORT/v1" `
+  -OpenAIApiKey "local-key" `
+  -DefaultModel "local-gemma-model" `
+  -GemmaModels "local-gemma-model" `
+  -TenantMaxConcurrentRequests 16 `
+  -MaxParallelAgents 4 `
+  -PublicReasoning always `
+  -TrainingTrace
+```
+
+Windows deployment for a local OpenAI-compatible Qwen backend:
+
+```powershell
+.\scripts\windows\start-miya-api.ps1 `
+  -BindAddr "127.0.0.1:3100" `
+  -OpenAIBaseUrl "http://localhost:8000/v1" `
+  -OpenAIApiKey "local-key" `
+  -DefaultModel "local-qwen-model" `
+  -TenantMaxConcurrentRequests 16 `
+  -MaxParallelAgents 4 `
+  -PublicReasoning always `
+  -TrainingTrace
+```
+
+Use the host name and port that actually serve `/v1/chat/completions` on your machine.
+
+Smoke test:
+
+```powershell
+.\scripts\windows\smoke-miya-api.ps1 `
+  -BaseUrl "http://127.0.0.1:3100" `
+  -Model "local-qwen-model"
+```
+
+On this Windows deployment the launcher defaults to `127.0.0.1:3100` because port `3000` is commonly occupied by Docker/WSL relay processes. Use `http://localhost:3100/v1` or `http://127.0.0.1:3100/v1` in OpenAI Chat Completions clients.
+
+For SillyTavern Text Completion with `api_type: generic`, use:
+
+```text
+http://127.0.0.1:3100
+```
+
+SillyTavern automatically appends `/v1/completions` for that mode. For SillyTavern Chat Completion with `Custom (OpenAI-compatible)`, use:
+
+```text
+http://127.0.0.1:3100/v1
+```
+
+Invoke one CLI request and print its matching backend telemetry:
+
+```powershell
+.\scripts\windows\invoke-miya-api.ps1 `
+  -BaseUrl "http://localhost:3100" `
+  -Model "local-qwen-model" `
+  -Effort low `
+  -MaxParallelAgents 4 `
+  -Message "OK"
+```
+
+Watch backend usage records live:
+
+```powershell
+.\scripts\windows\watch-miya-api-telemetry.ps1 -Follow
+```
+
+Watch training samples live:
+
+```powershell
+.\scripts\windows\watch-miya-training-traces.ps1 -Follow
+```
+
+Export recorded JSONL samples as a single JSON array for training:
+
+```powershell
+.\scripts\windows\export-miya-training-dataset.ps1 `
+  -OutputPath "logs\training-dataset.json"
+```
+
+Stop the deployed process:
+
+```powershell
+.\scripts\windows\stop-miya-api.ps1
+```
+
+The Windows launcher sets:
+
+```text
+MULTI_AGENT_PROVIDER=openai
+OPENAI_BASE_URL=http://YOUR_BACKEND_HOST:PORT/v1
+OPENAI_API_KEY=local-key
+TENANT_MAX_CONCURRENT_REQUESTS=16
+MULTI_AGENT_MAX_PARALLEL_AGENTS=4
+MULTI_AGENT_MODELS=local-model,mock
+MIYA_GEMMA_MODELS=local-gemma-model
+MIYA_PUBLIC_REASONING=always
+TRAINING_TRACE=enabled
+TRAINING_TRACE_PATH=logs\training-traces.jsonl
+```
+
+For a Windows Gemma-format deployment, `MIYA_GEMMA_MODELS=local-gemma-model` tells the gateway to keep thinking enabled and use `GemmaSystemToken` formatting. The API kernel does not hardcode that model ID; change the environment value when deploying another Gemma-format alias.
+
+The `/v1/models` response expands that base list with effort aliases. With the Windows defaults above, frontends can select `local-model-none`, `local-model-low`, `local-model-medium`, `local-model-high`, or `local-model-xhigh`; all are forwarded upstream as `local-model`.
+
+Windows stdout telemetry is written to:
+
+```text
+logs\api-server.out.log
+```
+
 Run against Anthropic-compatible backend:
 
 ```bash
@@ -429,6 +787,82 @@ cargo run -p api-server
 | `ANTHROPIC_VERSION` | `2023-06-01` | Anthropic API version header |
 | `CONTEXT_STORE` | enabled | set to `disabled` to disable SurrealKV context |
 | `CONTEXT_STORE_PATH` | `.multi-agent-context/surrealkv` | SurrealKV storage path |
+| `TENANT_MAX_CONCURRENT_REQUESTS` | `16` in env-built router | per-tenant concurrency cap; `0` disables |
+| `MULTI_AGENT_MAX_PARALLEL_AGENTS` | `4` | max concurrent child-agent provider calls; aliases: `MIYA_MAX_PARALLEL_AGENTS`, `MAX_PARALLEL_AGENTS` |
+| `MIYA_PUBLIC_REASONING` | `always` | public multi-agent reasoning summary policy: `always`, `request`, `never`/`strip`; aliases: `MIYA_PUBLIC_REASONING_MODE`, `MULTI_AGENT_PUBLIC_REASONING`, `PUBLIC_REASONING_MODE` |
+| `TRAINING_TRACE` | disabled | set to `enabled`, `true`, or `1` to append training samples |
+| `TRAINING_TRACE_PATH` | `logs/training-traces.jsonl` | JSONL training sample output path |
+
+## Usage And Telemetry
+
+OpenAI-compatible responses include:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 223,
+    "completion_tokens": 2,
+    "total_tokens": 225
+  }
+}
+```
+
+Anthropic-compatible responses include:
+
+```json
+{
+  "usage": {
+    "input_tokens": 223,
+    "output_tokens": 2
+  }
+}
+```
+
+The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`.
+
+Telemetry fields include `route`, `model`, `tenant_id`, `request_id`, `conversation_fingerprint`, `reasoning_effort`, `stream`, `batch_index`, `direct_passthrough`, `input_tokens`, `output_tokens`, `total_tokens`, `provider_call_count`, `task_count`, `child_agent_count`, `tool_call_count`, `verification`, and optional context-cache details.
+
+For CLI correlation, send `x-request-id`; the gateway uses that ID in telemetry. The Windows `invoke-miya-api.ps1` script generates one automatically, sends the request, then prints the matching telemetry row from the JSONL log.
+
+Telemetry deliberately does not log raw prompts, final answer text, child-agent artifacts, child-agent tool calls, or hidden thinking. Root provider streaming paths record token usage when the upstream stream exposes a usage event; non-streaming paths use provider response usage directly.
+
+## Training Trace Recording
+
+Training trace recording is separate from usage telemetry. It is designed for building your own model training dataset, and is opt-in because it records raw input, output, tool calls, tool observations, and structured orchestration steps.
+
+Enable it:
+
+```bash
+TRAINING_TRACE=enabled \
+TRAINING_TRACE_PATH=logs/training-traces.jsonl \
+cargo run -p api-server
+```
+
+Each JSONL line is a training sample in this schema:
+
+```json
+{
+  "conversations": [
+    {"from": "human", "value": "人类指令"},
+    {"from": "function_call", "value": "{\"name\":\"lookup\",\"arguments\":{\"key\":\"x\"}}"},
+    {"from": "observation", "value": "{\"result\":{\"value\":\"42\"}}"},
+    {"from": "gpt", "value": "模型回答"}
+  ],
+  "system": "系统提示词",
+  "tools": "[{\"name\":\"lookup\",\"description\":\"...\"}]"
+}
+```
+
+For multi-agent orchestration, the recorder also converts bounded sub-agent dispatch into trainable tool-use turns with `spawn_agent` as an internal tool and child-agent outputs as `observation` turns. This records the useful intermediate process without relying on hidden provider reasoning.
+
+Windows commands:
+
+```powershell
+.\scripts\windows\start-miya-api.ps1 -TrainingTrace
+.\scripts\windows\invoke-miya-api.ps1 -ShowTrainingTrace
+.\scripts\windows\watch-miya-training-traces.ps1 -Follow
+.\scripts\windows\export-miya-training-dataset.ps1
+```
 
 ## Examples
 
@@ -438,7 +872,7 @@ cargo run -p api-server
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "content-type: application/json" \
   -d '{
-    "model": "Qwen3.6-27B",
+    "model": "local-qwen-model",
     "reasoning": { "effort": "high" },
     "metadata": {
       "thinking_mode": true,
@@ -637,7 +1071,7 @@ cargo test -p api-server
 The current test suite covers:
 
 - protocol serialization
-- reasoning effort to agent budget mapping
+- reasoning effort to agent coverage mapping
 - scoped artifact isolation
 - scoped tool ledger behavior
 - spawn depth and agent-count rejection
@@ -649,6 +1083,7 @@ The current test suite covers:
 - tool call and tool result compatibility
 - legacy OpenAI function compatibility
 - OpenAI and Anthropic route responses
+- response usage mapping and backend usage telemetry
 - SSE formatting and upstream SSE parsing
 - batch concurrency and response isolation
 - SurrealKV context rewind

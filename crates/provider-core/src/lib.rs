@@ -25,11 +25,14 @@ pub struct ProviderRequest {
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: Option<bool>,
     pub tool_results: Vec<ToolResultRecord>,
+    pub provider_options: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderUsage {
+    #[serde(default, alias = "prompt_tokens")]
     pub input_tokens: u32,
+    #[serde(default, alias = "completion_tokens")]
     pub output_tokens: u32,
 }
 
@@ -105,11 +108,15 @@ where
 
 pub fn provider_response_stream(response: ProviderResponse) -> ProviderStream {
     let mut events = Vec::new();
+    let usage = response.usage.clone();
     if response.tool_calls.is_empty() {
         for artifact in response.artifacts {
             if let AgentArtifact::Text { text, .. } = artifact {
                 events.push(Ok(ProviderStreamEvent::TextDelta { text }));
             }
+        }
+        if usage != ProviderUsage::default() {
+            events.push(Ok(ProviderStreamEvent::Usage { usage }));
         }
         events.push(Ok(ProviderStreamEvent::Finish {
             reason: ProviderFinishReason::Stop,
@@ -123,14 +130,11 @@ pub fn provider_response_stream(response: ProviderResponse) -> ProviderStream {
                 arguments_delta: call.arguments_json.to_string(),
             }));
         }
+        if usage != ProviderUsage::default() {
+            events.push(Ok(ProviderStreamEvent::Usage { usage }));
+        }
         events.push(Ok(ProviderStreamEvent::Finish {
             reason: ProviderFinishReason::ToolCalls,
-        }));
-    }
-
-    if response.usage != ProviderUsage::default() {
-        events.push(Ok(ProviderStreamEvent::Usage {
-            usage: response.usage,
         }));
     }
 

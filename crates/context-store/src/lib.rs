@@ -125,19 +125,26 @@ impl SurrealKvContextStore {
     ) -> Result<ContextAssembly, ContextStoreError> {
         validate_component("tenant_id", tenant_id)?;
         validate_component("context_id", context_id)?;
+        let normalized_options = options.normalized();
 
-        let Some(head) = self.head(tenant_id, context_id, options.rewind_revision)? else {
-            return Ok(ContextAssembly::empty(context_id));
+        let Some(head) = self.head(tenant_id, context_id, normalized_options.rewind_revision)?
+        else {
+            return Ok(ContextAssembly::empty_with_namespace(
+                context_id,
+                normalized_options.cache_namespace,
+            ));
         };
         if head.latest_revision == 0 {
-            return Ok(ContextAssembly::empty(context_id));
+            return Ok(ContextAssembly::empty_with_namespace(
+                context_id,
+                normalized_options.cache_namespace,
+            ));
         }
 
-        let target_revision = options
+        let target_revision = normalized_options
             .rewind_revision
             .unwrap_or(head.latest_revision)
             .min(head.latest_revision);
-        let normalized_options = options.normalized();
         let policy_hash = assembly_policy_hash(&normalized_options);
 
         if normalized_options.cache_enabled
@@ -147,6 +154,7 @@ impl SurrealKvContextStore {
             if pack.revision == target_revision {
                 return Ok(ContextAssembly {
                     context_id: context_id.to_string(),
+                    cache_namespace: normalized_options.cache_namespace,
                     revision: target_revision,
                     text: pack.text,
                     included_chunks: pack.included_chunks,
@@ -176,6 +184,7 @@ impl SurrealKvContextStore {
                 let text = trim_to_char_boundary(text, normalized_options.max_context_bytes);
                 let assembly = ContextAssembly {
                     context_id: context_id.to_string(),
+                    cache_namespace: normalized_options.cache_namespace.clone(),
                     revision: target_revision,
                     included_chunks: pack.included_chunks + tail_chunks.len(),
                     included_bytes: text.len(),
@@ -195,6 +204,7 @@ impl SurrealKvContextStore {
         let text = render_chunks(selected, normalized_options.max_context_bytes);
         let assembly = ContextAssembly {
             context_id: context_id.to_string(),
+            cache_namespace: normalized_options.cache_namespace.clone(),
             revision: target_revision,
             included_chunks: chunks.len(),
             included_bytes: text.len(),
@@ -267,6 +277,7 @@ impl SurrealKvContextStore {
         let mut txn = self.tree.begin()?;
         let pack = ContextPack {
             context_id: context_id.to_string(),
+            cache_namespace: assembly.cache_namespace.clone(),
             revision: assembly.revision,
             policy_hash: policy_hash.to_string(),
             text: assembly.text.clone(),
@@ -314,6 +325,7 @@ impl ContextHead {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextAssemblyOptions {
     pub query: Option<String>,
+    pub cache_namespace: String,
     pub rewind_revision: Option<u64>,
     pub max_context_bytes: usize,
     pub max_chunks: usize,
@@ -325,6 +337,7 @@ impl Default for ContextAssemblyOptions {
     fn default() -> Self {
         Self {
             query: None,
+            cache_namespace: "default".to_string(),
             rewind_revision: None,
             max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
             max_chunks: DEFAULT_MAX_CHUNKS,
@@ -339,6 +352,7 @@ impl ContextAssemblyOptions {
         self.max_context_bytes = self.max_context_bytes.clamp(1, DEFAULT_MAX_CONTEXT_BYTES);
         self.max_chunks = self.max_chunks.clamp(1, DEFAULT_MAX_CHUNKS);
         self.recent_tail_chunks = self.recent_tail_chunks.min(self.max_chunks);
+        self.cache_namespace = normalize_cache_namespace(self.cache_namespace);
         self
     }
 }
@@ -346,6 +360,7 @@ impl ContextAssemblyOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextAssembly {
     pub context_id: String,
+    pub cache_namespace: String,
     pub revision: u64,
     pub text: String,
     pub included_chunks: usize,
@@ -356,9 +371,10 @@ pub struct ContextAssembly {
 }
 
 impl ContextAssembly {
-    fn empty(context_id: &str) -> Self {
+    fn empty_with_namespace(context_id: &str, cache_namespace: String) -> Self {
         Self {
             context_id: context_id.to_string(),
+            cache_namespace,
             ..Self::default()
         }
     }
@@ -379,6 +395,8 @@ struct StoredContextChunk {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ContextPack {
     context_id: String,
+    #[serde(default)]
+    cache_namespace: String,
     revision: u64,
     policy_hash: String,
     text: String,
@@ -493,6 +511,8 @@ fn query_terms(query: &str) -> Vec<String> {
 
 fn assembly_policy_hash(options: &ContextAssemblyOptions) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(options.cache_namespace.as_bytes());
+    hasher.update([0]);
     hasher.update(options.max_context_bytes.to_be_bytes());
     hasher.update(options.max_chunks.to_be_bytes());
     hasher.update(options.recent_tail_chunks.to_be_bytes());
@@ -500,6 +520,15 @@ fn assembly_policy_hash(options: &ContextAssemblyOptions) -> String {
         hasher.update(query.as_bytes());
     }
     hex::encode(hasher.finalize())
+}
+
+fn normalize_cache_namespace(value: String) -> String {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        "default".to_string()
+    } else {
+        normalized.chars().take(256).collect()
+    }
 }
 
 fn validate_component(name: &str, value: &str) -> Result<(), ContextStoreError> {
@@ -611,6 +640,7 @@ mod tests {
                 "ctx",
                 ContextAssemblyOptions {
                     query: Some("needle".to_string()),
+                    cache_namespace: "default".to_string(),
                     rewind_revision: Some(first.latest_revision),
                     max_context_bytes: 4096,
                     max_chunks: 8,
@@ -634,7 +664,7 @@ mod tests {
             let text = if index == 377 {
                 "needle marker: launch code violet".to_string()
             } else {
-                format!("filler roleplay memory line {index}")
+                format!("filler long-context memory line {index}")
             };
             records.push(ContextAppendRecord {
                 role: "user".to_string(),
@@ -649,6 +679,7 @@ mod tests {
                 "haystack",
                 ContextAssemblyOptions {
                     query: Some("violet launch".to_string()),
+                    cache_namespace: "default".to_string(),
                     max_context_bytes: 2048,
                     max_chunks: 6,
                     recent_tail_chunks: 2,
@@ -674,7 +705,7 @@ mod tests {
                 vec![
                     ContextAppendRecord {
                         role: "system".to_string(),
-                        text: "common roleplay lore".to_string(),
+                        text: "common project memory".to_string(),
                     },
                     ContextAppendRecord {
                         role: "user".to_string(),
@@ -715,7 +746,7 @@ mod tests {
 
         assert!(third.cache_hit);
         assert_eq!(third.base_cache_revision, Some(first.revision));
-        assert!(third.text.contains("common roleplay lore"));
+        assert!(third.text.contains("common project memory"));
         assert!(third.text.contains("small generated tail"));
         assert_eq!(third.tail_chunks, 1);
     }

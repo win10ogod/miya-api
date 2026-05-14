@@ -165,6 +165,7 @@ pub enum AgentRole {
     Leader,
     Worker,
     Verifier,
+    ReasoningSummarizer,
     Synthesizer,
 }
 
@@ -422,6 +423,10 @@ pub struct NormalizedRequest {
     pub thinking_enabled: bool,
     pub thinking_format: ThinkingFormat,
     pub reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub public_reasoning_enabled: bool,
+    #[serde(default)]
+    pub provider_options: serde_json::Value,
     pub metadata: serde_json::Value,
 }
 
@@ -467,9 +472,10 @@ impl ReasoningEffort {
     pub fn max_agents(&self) -> u16 {
         match self {
             Self::None => 0,
-            Self::Low | Self::Medium => 4,
-            Self::High => 16,
-            Self::XHigh => 32,
+            Self::Low => 4,
+            Self::Medium => 16,
+            Self::High => 32,
+            Self::XHigh => 64,
         }
     }
 
@@ -596,9 +602,9 @@ mod tests {
     fn reasoning_effort_maps_to_agent_limits() {
         assert_eq!(ReasoningEffort::None.max_agents(), 0);
         assert_eq!(ReasoningEffort::Low.max_agents(), 4);
-        assert_eq!(ReasoningEffort::Medium.max_agents(), 4);
-        assert_eq!(ReasoningEffort::High.max_agents(), 16);
-        assert_eq!(ReasoningEffort::XHigh.max_agents(), 32);
+        assert_eq!(ReasoningEffort::Medium.max_agents(), 16);
+        assert_eq!(ReasoningEffort::High.max_agents(), 32);
+        assert_eq!(ReasoningEffort::XHigh.max_agents(), 64);
     }
 
     fn root_task_id(value: &str) -> TaskId {
