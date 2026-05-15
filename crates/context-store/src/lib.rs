@@ -293,6 +293,89 @@ impl SurrealKvContextStore {
         txn.commit().await?;
         Ok(())
     }
+
+    pub async fn put_json(
+        &self,
+        namespace: &str,
+        tenant_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), ContextStoreError> {
+        validate_component("namespace", namespace)?;
+        validate_component("tenant_id", tenant_id)?;
+        validate_component("key", key)?;
+
+        let mut txn = self.tree.begin()?;
+        txn.set_durability(Durability::Immediate);
+        txn.set(
+            json_key(namespace, tenant_id, key),
+            serde_json::to_vec(&value)?,
+        )?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub fn get_json(
+        &self,
+        namespace: &str,
+        tenant_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, ContextStoreError> {
+        validate_component("namespace", namespace)?;
+        validate_component("tenant_id", tenant_id)?;
+        validate_component("key", key)?;
+
+        let txn = self.tree.begin()?;
+        txn.get(json_key(namespace, tenant_id, key))?
+            .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+            .transpose()
+            .map_err(ContextStoreError::from)
+    }
+
+    pub async fn delete_json(
+        &self,
+        namespace: &str,
+        tenant_id: &str,
+        key: &str,
+    ) -> Result<bool, ContextStoreError> {
+        validate_component("namespace", namespace)?;
+        validate_component("tenant_id", tenant_id)?;
+        validate_component("key", key)?;
+
+        let existing = self.get_json(namespace, tenant_id, key)?.is_some();
+        if !existing {
+            return Ok(false);
+        }
+
+        let mut txn = self.tree.begin()?;
+        txn.set_durability(Durability::Immediate);
+        txn.delete(json_key(namespace, tenant_id, key))?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub fn list_json(
+        &self,
+        namespace: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<serde_json::Value>, ContextStoreError> {
+        validate_component("namespace", namespace)?;
+        validate_component("tenant_id", tenant_id)?;
+
+        let txn = self.tree.begin()?;
+        let prefix = json_prefix(namespace, tenant_id);
+        let mut end = prefix.clone();
+        end.push(0xff);
+        let mut iter = txn.range(prefix, end)?;
+        let mut values = Vec::new();
+        iter.seek_first()?;
+        while iter.valid() {
+            let value = iter.value()?;
+            values.push(serde_json::from_slice::<serde_json::Value>(&value)?);
+            iter.next()?;
+        }
+        Ok(values)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +654,21 @@ fn pack_key(tenant_id: &str, context_id: &str, policy_hash: &str) -> Vec<u8> {
         encode_component(context_id)
     )
     .into_bytes()
+}
+
+fn json_prefix(namespace: &str, tenant_id: &str) -> Vec<u8> {
+    format!(
+        "json/{}/{}/",
+        encode_component(namespace),
+        encode_component(tenant_id)
+    )
+    .into_bytes()
+}
+
+fn json_key(namespace: &str, tenant_id: &str, key: &str) -> Vec<u8> {
+    let mut prefix = json_prefix(namespace, tenant_id);
+    prefix.extend(encode_component(key).as_bytes());
+    prefix
 }
 
 fn encode_component(value: &str) -> String {

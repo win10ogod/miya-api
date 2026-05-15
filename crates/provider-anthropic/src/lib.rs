@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, pin::Pin};
+use std::{collections::VecDeque, pin::Pin, time::Duration};
 
 use agent_protocol::*;
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ impl AnthropicProvider {
         api_version: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: provider_http_client(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             api_version: api_version.into(),
@@ -57,7 +57,7 @@ impl AnthropicProvider {
             body["thinking"] = anthropic_thinking_config();
         }
 
-        if request.tool_results.is_empty() && !request.tools.is_empty() {
+        if !request.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(
                 request
                     .tools
@@ -150,6 +150,28 @@ impl AnthropicProvider {
     }
 }
 
+fn provider_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(env_u64(
+            "MIYA_PROVIDER_TIMEOUT_SECS",
+            300,
+        )))
+        .connect_timeout(Duration::from_secs(env_u64(
+            "MIYA_PROVIDER_CONNECT_TIMEOUT_SECS",
+            30,
+        )))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 fn anthropic_thinking_config() -> serde_json::Value {
     serde_json::json!({
         "type": "enabled",
@@ -188,8 +210,13 @@ fn format_system_prompt(
             user_system_instructions.join("\n")
         )
     };
+    let worker_contract = if matches!(role, AgentRole::Worker) {
+        " Worker agents have no client-visible tools in this turn; do not request, invent, or simulate tool calls. Return a concise intermediate artifact only."
+    } else {
+        ""
+    };
     format!(
-        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details. Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections.{user_instructions}"
+        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details.{worker_contract} Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections.{user_instructions}"
     )
 }
 
@@ -860,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_payload_feeds_tool_results_back_without_recalling_tools() {
+    fn anthropic_payload_feeds_tool_results_back_and_keeps_tools_available() {
         let mut request = provider_request_with_media(MediaSource::Base64 {
             data: "AAAA".to_string(),
         });
@@ -879,7 +906,8 @@ mod tests {
 
         let body = AnthropicProvider::build_request_body(&request);
 
-        assert!(body.get("tools").is_none());
+        assert_eq!(body["tools"][0]["name"], "lookup_weather");
+        assert!(body.get("tool_choice").is_none());
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Tool results available to the main agent"));
         assert!(text.contains("call-1"));
@@ -892,6 +920,11 @@ mod tests {
             data: "AAAA".to_string(),
         });
         request.media_artifacts.clear();
+        request.tools = vec![ToolDefinition {
+            name: "lookup_weather".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
         request.messages = vec![
             NormalizedMessage {
                 role: MessageRole::User,
@@ -924,6 +957,7 @@ mod tests {
 
         let body = AnthropicProvider::build_request_body(&request);
 
+        assert_eq!(body["tools"][0]["name"], "lookup_weather");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][1]["role"], "assistant");
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");

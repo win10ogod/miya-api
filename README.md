@@ -1,10 +1,10 @@
 # Miya API
 
-Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messages 相容多代理 API 閘道。API 使用者仍然只送出一次標準相容請求；後端會依 `reasoning.effort` 以 deterministic orchestration 將任務拆解為有界子任務，並行派發給子代理，最後由 synthesizer 彙整為單一可用答案。對前端來說它仍然像單一 OpenAI/Anthropic 相容 API；對後端來說它是可控的多請求 fan-out、上下文快取、工具帳本與最終合成管線。
+Miya API 是一個以 Rust 實作的 OpenAI Responses、OpenAI Chat Completions 與 Anthropic Messages 相容多代理 API 閘道。API 使用者仍然只送出一次標準相容請求；後端會由 leader/planner 模型依 `reasoning.effort` 和實際任務內容產生結構化 `spawn_plan`，內核再以有界並行派發子代理，最後由 synthesizer 彙整為單一可用答案。對前端來說它仍然像單一 OpenAI/Anthropic 相容 API；對後端來說它是可控的多請求 fan-out、上下文快取、工具帳本與最終合成管線。
 
 本專案的目標不是做「多個 chatbot 互聊」的展示型 agent playground，而是提供可商用 API 所需要的核心行為：
 
-- deterministic orchestration
+- model-selected orchestration with deterministic kernel execution
 - bounded agent execution
 - structured intermediate artifacts
 - scoped tool-call accounting
@@ -15,7 +15,7 @@ Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messa
 - OpenAI/Anthropic tool-call 相容輸出
 - true provider token streaming for direct/root streaming paths
 - structured usage telemetry with output-token accounting
-- bounded concurrent provider calls, default 4-way child-agent fan-out
+- bounded concurrent provider calls, default medium tier 16 child agents with 4 in-flight workers
 - optional encrypted sub-agent state disclosure
 - SurrealKV-backed rewindable long-context store and context-pack cache
 - header/metadata-based multi-tenant isolation
@@ -26,7 +26,7 @@ Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messa
 
 商用部署時的核心邊界是：
 
-- Client compatibility: 前端仍使用標準 `/v1/chat/completions`、`/v1/messages`、stream、batch、tool-call 格式。
+- Client compatibility: 前端仍使用標準 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`、stream、batch、tool-call 格式。
 - Provider efficiency: 子代理會以有界並行向同一後端發送多個標準 provider request，預設最多 4 個 child-agent request 同時在飛。
 - Isolation: tenant、request、conversation、artifact、tool-call、context cache key 都有明確隔離，避免批量請求或多用戶場景串話。
 - Cache discipline: context-pack cache 依 tenant/context/revision/retrieval policy/model/tools/thinking/provider options/system hash 切分，避免不同後端格式、模型或工具 schema 共用錯誤上下文。
@@ -35,7 +35,7 @@ Miya API 是一個以 Rust 實作的 OpenAI Chat Completions 與 Anthropic Messa
 仍需注意：
 
 - 伺服器只代理或編排模型呼叫，不會在後端任意執行使用者定義工具。工具呼叫會以 OpenAI/Anthropic 相容格式回給前端，由前端或客戶端執行工具後再把 tool result 送回。
-- 高推理難度會增加可用 agent coverage 與 deterministic fan-out；token 用量會被記錄為 telemetry，不會作為阻止子代理生成的條件。
+- 高推理難度會增加可用 agent coverage 與模型規劃上限；token 用量會被記錄為 telemetry，不會作為阻止子代理生成的條件。
 - full multi-agent orchestration 的 streaming 會在完成 orchestration 後輸出相容 SSE；只有 `reasoning.effort=none` 與不需完整 orchestration 的 root path 會直接轉發 provider token streaming。
 
 ## Architecture
@@ -58,7 +58,7 @@ provider-core
   |
   +-- provider-openai      -> /v1/chat/completions
   +-- provider-anthropic   -> /v1/messages
-  +-- MockProvider         -> deterministic local tests
+  +-- MockProvider         -> reproducible local tests
 ```
 
 Workspace layout:
@@ -82,9 +82,9 @@ crates/
 4. Tool definitions and tool results become structured protocol records.
 5. `reasoning.effort` selects the agent coverage tier.
 6. The leader/root agent receives preserved user system instructions plus an orchestration policy.
-7. The leader may emit a structured `SpawnPlan`.
+7. The leader/planner emits a structured `SpawnPlan` that decides the child-agent division for this request.
 8. The kernel validates spawn depth, total agent count, artifact scope and tool-call budgets.
-9. Child agents run through a bounded concurrent fan-out queue; results are sorted back into deterministic task order before verification.
+9. Child agents run through a bounded concurrent fan-out queue; results are sorted back into stable task order before verification.
 10. Child outputs are stored as internal artifacts; their state is AES-256-GCM encrypted.
 11. Root-visible unresolved tool calls are returned to the user if tools are required.
 12. If public reasoning is enabled, one dedicated `reasoning-summary` agent summarizes worker outputs for the frontend reasoning field only.
@@ -112,6 +112,18 @@ POST /v1/v1/chat/completions
 POST /chat/completions/batch
 POST /v1/chat/completions/batch
 POST /v1/v1/chat/completions/batch
+POST /responses
+GET  /responses
+POST /v1/responses
+GET  /v1/responses
+POST /v1/v1/responses
+GET  /v1/v1/responses
+GET  /v1/responses/{response_id}
+DELETE /v1/responses/{response_id}
+POST /v1/responses/{response_id}/cancel
+GET  /v1/responses/{response_id}/input_items
+POST /v1/responses/input_tokens
+POST /v1/responses/compact
 ```
 
 Canonical OpenAI-compatible base URL is `/v1`. The root and double-`/v1` aliases exist for frontends that either omit `/v1` or append `/v1` themselves. In practice:
@@ -135,7 +147,48 @@ Supported request features:
 - `thinking`, `enable_thinking`, `preserve_thinking`, `chat_template_kwargs`
 - `reasoning.effort`
 - `metadata`
-- provider model options such as `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `response_format`, `seed`, `stop`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `modalities`, `audio`, `prediction`, `service_tier`, `stream_options`, `reasoning_effort`, `verbosity`, `user`, `safety_identifier`, and backend-specific extra fields
+- provider model options such as `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `response_format`, `seed`, `stop`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `modalities`, `audio`, `prediction`, `service_tier`, `stream_options`, `verbosity`, `user`, `safety_identifier`, and backend-specific extra fields
+
+### OpenAI Responses-compatible API
+
+`POST /v1/responses` is implemented as a compatibility layer on top of the same Rust orchestration kernel and provider adapters. It accepts the Responses request shape, normalizes it into the internal chat representation, runs either direct provider passthrough or model-selected multi-agent orchestration, then emits Responses-shaped output items and SSE events.
+
+Supported Responses features:
+
+- string `input`
+- message input items
+- input content parts: `input_text`, `text`, `input_image`, `image_url`
+- output/tool history items: `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `local_shell_call`, `shell_call`, `apply_patch_call`, and matching output items
+- `instructions`
+- `tools`, including Responses-style top-level function tools and OpenAI Chat-style `function` tools
+- `tool_choice`
+- `parallel_tool_calls`
+- `stream`
+- `store`
+- `previous_response_id`
+- `metadata` tenant/request/conversation isolation
+- `reasoning_effort`, `reasoning.effort`, and effort-suffixed model aliases
+- `max_output_tokens`, `temperature`, `top_p`, `top_logprobs`, `text.response_format`, and backend-specific extra model options
+
+Stored Responses are tenant-scoped and backed by SurrealKV when `CONTEXT_STORE_PATH` is configured, with an in-memory mirror for fast local reads. `previous_response_id` reloads the stored conversation messages for the same tenant only, so different tenants cannot continue or retrieve each other's response chains.
+
+Streaming emits Responses-style SSE events:
+
+```text
+response.created
+response.in_progress
+response.output_item.added
+response.content_part.added
+response.output_text.delta
+response.output_text.done
+response.function_call_arguments.delta
+response.function_call_arguments.done
+response.output_item.done
+response.completed
+data: [DONE]
+```
+
+`GET /v1/responses/{response_id}` retrieves a stored response, `GET /v1/responses/{response_id}/input_items` returns the original input items, and `DELETE /v1/responses/{response_id}` removes tenant-scoped stored state. `POST /v1/responses/input_tokens` provides a local token estimate for frontend budgeting. `POST /v1/responses/compact` returns a compacted artifact envelope suitable for clients expecting the endpoint; semantic model-driven compaction is intentionally kept separate from this compatibility response.
 
 Legacy OpenAI Completions compatibility:
 
@@ -169,7 +222,7 @@ Supported request features:
 - `tool_result` history
 - `stream`
 - `thinking`
-- `reasoning.effort`
+- `reasoning_effort`, `reasoning.effort`
 - `metadata`
 - provider model options such as `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `metadata`, service-tier/provider beta fields, and backend-specific extra fields
 
@@ -183,7 +236,7 @@ Gateway-consumed parameters:
 
 | location | consumed by gateway |
 | --- | --- |
-| `reasoning.effort` | selects direct mode or multi-agent coverage tier: `none`, `low`, `medium`, `high`, `xhigh` |
+| `reasoning_effort`, `reasoning.effort` | selects direct mode or multi-agent coverage tier: `none`, `low`, `medium`, `high`, `xhigh` |
 | `metadata.tenant_id`, tenant aliases | tenant isolation and per-tenant concurrency |
 | `metadata.request_id`, request aliases | request correlation and telemetry |
 | `metadata.conversation_id`, thread/session aliases | conversation fingerprint and scoped artifacts |
@@ -206,7 +259,7 @@ Every non-mock model exposed by `MULTI_AGENT_MODELS` also gets effort-suffixed m
 
 For example, if `MULTI_AGENT_MODELS=local-model,mock`, `/v1/models` exposes `local-model`, `local-model-none`, `local-model-low`, `local-model-medium`, `local-model-high`, `local-model-xhigh`, and `mock`.
 
-The alias is gateway-only. A request using `model: "local-model-high"` is sent to the backend as `model: "local-model"` while Miya uses `reasoning.effort=high`. The alias wins over conflicting request fields such as `reasoning.effort`, so frontends that cannot set custom reasoning fields can select the tier purely through the model name.
+The alias is gateway-only. A request using `model: "local-model-high"` is sent to the backend as `model: "local-model"` while Miya uses `reasoning.effort=high`. The alias wins over conflicting request fields such as top-level `reasoning_effort` and nested `reasoning.effort`, so frontends that cannot set custom reasoning fields can select the tier purely through the model name. Without a model suffix, top-level `reasoning_effort` is preferred over nested `reasoning.effort`.
 
 Everything else is treated as provider configuration. For OpenAI-compatible requests, unknown top-level JSON fields are captured and merged into the upstream `/chat/completions` body after normalization. For Anthropic-compatible requests, unknown top-level JSON fields are captured and merged into the upstream `/messages` body. This includes both official model controls and OpenAI-compatible local-server extensions.
 
@@ -217,7 +270,7 @@ Reserved transport/core fields cannot be overridden by pass-through because the 
 | OpenAI-compatible | `model`, `messages`, `tools`, `tool_choice`, `parallel_tool_calls`, `stream`, `functions`, `function_call` |
 | Anthropic-compatible | `model`, `system`, `messages`, `tools`, `tool_choice`, `stream` |
 
-`metadata` is handled specially: gateway-only keys are stripped before provider forwarding, but unrelated metadata keys are preserved. For example `metadata.foo` is forwarded, while `metadata.tenant_id` and `metadata.context` are not. `reasoning` is also handled specially: nested `reasoning.effort` is removed before forwarding because it controls Miya's agent coverage tier, while other nested reasoning provider options such as `reasoning.summary` are preserved. Top-level `reasoning_effort` is not consumed by Miya and is forwarded as a provider option.
+`metadata` is handled specially: gateway-only keys are stripped before provider forwarding, but unrelated metadata keys are preserved. For example `metadata.foo` is forwarded, while `metadata.tenant_id` and `metadata.context` are not. `reasoning` is also handled specially: nested `reasoning.effort` is removed before forwarding because it controls Miya's agent coverage tier, while other nested reasoning provider options such as `reasoning.summary` are preserved. Top-level `reasoning_effort` is also consumed by Miya and stripped before provider forwarding.
 
 Example:
 
@@ -245,7 +298,7 @@ Example:
 }
 ```
 
-The gateway uses `reasoning.effort=medium`, tenant/context metadata and cache policy. The provider still receives `temperature`, `top_p`, `max_completion_tokens`, `response_format`, `stream_options`, top-level `reasoning_effort`, `reasoning.summary`, and `metadata.foo`.
+The gateway uses top-level `reasoning_effort=low`, tenant/context metadata and cache policy. The provider still receives `temperature`, `top_p`, `max_completion_tokens`, `response_format`, `stream_options`, `reasoning.summary`, and `metadata.foo`.
 
 ## Multi-User Isolation
 
@@ -292,7 +345,7 @@ Production routers also apply a per-tenant concurrency limiter. `TENANT_MAX_CONC
 
 ## Reasoning Effort
 
-`reasoning.effort` controls whether the gateway runs direct provider mode or multi-agent orchestration, and how much child-agent coverage the kernel allows. Agent coverage and provider-call concurrency are intentionally separate: `medium` generates the 16-agent tier by default, while the default runtime only runs 4 child-agent backend calls at once so latency improves without unbounded provider pressure. Token usage is accounted and logged, not used as a stop condition for child-agent creation.
+`reasoning.effort` controls whether the gateway runs direct provider mode or multi-agent orchestration, and how much child-agent coverage the kernel allows. Agent coverage and provider-call concurrency are intentionally separate: `medium` gives the planner a 16-agent commercial coverage target by default, while the default runtime only runs 4 child-agent backend calls at once so latency improves without unbounded provider pressure. Token usage is accounted and logged, not used as a stop condition for child-agent creation.
 
 | effort | behavior | max agents per request | target child agents | default concurrent child calls |
 | --- | --- | ---: | ---: | ---: |
@@ -334,13 +387,13 @@ max_total_tool_calls=<N>
 token_accounting_reference=<N>
 ```
 
-The leader may spawn more child tasks than the concurrency limit. The kernel executes those children with bounded parallelism, sends multiple OpenAI/Anthropic-compatible provider calls in parallel, then restores deterministic task order before writing artifacts, accounting token/tool usage, sealing sub-agent state and invoking final synthesis.
+The leader may spawn more child tasks than the concurrency limit. The kernel executes those children with bounded parallelism, sends multiple OpenAI/Anthropic-compatible provider calls in parallel, then restores stable task order before writing artifacts, accounting token/tool usage, sealing sub-agent state and invoking final synthesis.
 
-The test suite includes deterministic coverage evaluation proving that higher effort increases actual task coverage instead of only changing metadata:
+The test suite includes model-planned coverage evaluation proving that higher effort increases actual task coverage instead of only changing metadata:
 
-- `low` reaches coverage score 3.
-- `high` reaches coverage score 8 in the bounded eval.
-- `xhigh` is asserted to be at least as strong as `high`.
+- `low` reaches coverage score 4.
+- `high` reaches coverage score 32 in the bounded eval.
+- `xhigh` reaches coverage score 64.
 - API route tests verify higher effort also produces more encrypted child-agent state externally.
 
 ## Thinking Modes
@@ -623,7 +676,7 @@ The encryption key is generated per `KernelRunner` process. Restarting the serve
 
 Install Rust stable with edition 2024 support.
 
-Run with deterministic mock provider:
+Run with reproducible mock provider:
 
 ```bash
 cargo run -p api-server
@@ -1088,7 +1141,7 @@ The current test suite covers:
 - batch concurrency and response isolation
 - SurrealKV context rewind
 - context-pack cache reuse
-- deterministic high-effort coverage improvement
+- model-planned high-effort coverage improvement
 
 ## License
 

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, pin::Pin};
+use std::{collections::VecDeque, pin::Pin, time::Duration};
 
 use agent_protocol::*;
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: provider_http_client(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
         }
@@ -56,7 +56,7 @@ impl OpenAiProvider {
             ThinkingFormat::GemmaSystemToken => {}
         }
 
-        if request.tool_results.is_empty() && !request.tools.is_empty() {
+        if !request.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(
                 openai_tools_for_request(request)
                     .into_iter()
@@ -152,6 +152,28 @@ impl OpenAiProvider {
     }
 }
 
+fn provider_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(env_u64(
+            "MIYA_PROVIDER_TIMEOUT_SECS",
+            300,
+        )))
+        .connect_timeout(Duration::from_secs(env_u64(
+            "MIYA_PROVIDER_CONNECT_TIMEOUT_SECS",
+            30,
+        )))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 fn format_system_prompt(
     role: &AgentRole,
     objective: &str,
@@ -167,9 +189,21 @@ fn format_system_prompt(
             user_system_instructions.join("\n")
         )
     };
+    let worker_contract = if matches!(role, AgentRole::Worker) {
+        " Worker agents have no client-visible tools in this turn; do not request, invent, or simulate tool calls. Return a concise intermediate artifact only."
+    } else {
+        ""
+    };
     let prompt = format!(
-        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details. Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections.{user_instructions}"
+        "You are a bounded multi-agent worker. Role: {role:?}. Objective: {objective}. If proposing child agents, return JSON with type=spawn_plan and a plan object. Final answers must be natural, directly useful, and must not expose sub-agent state, internal tool calls, or orchestration details.{worker_contract} Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections.{user_instructions}"
     );
+    let prompt = if objective.contains("orchestration plan") {
+        format!(
+            "{prompt}\n\nFor this orchestration-planner turn, return ONLY valid JSON for type=spawn_plan. Do not answer the user, do not ask whether to proceed, and do not include markdown fences unless the model backend requires them. The exact child-agent count is part of the task objective and must be satisfied. The kernel will validate limits, isolate child agents, run them in bounded parallelism, and synthesize the final answer."
+        )
+    } else {
+        prompt
+    };
     if thinking_enabled && thinking_format == &ThinkingFormat::GemmaSystemToken {
         format!("<|think|>\n{prompt}")
     } else {
@@ -503,7 +537,10 @@ fn openai_messages(request: &ProviderRequest) -> Vec<serde_json::Value> {
         )
     })];
 
-    if request.messages.is_empty() || should_fallback_to_text_tool_results(request) {
+    if request.messages.is_empty()
+        || should_fallback_to_text_tool_results(request)
+        || should_render_tool_history_as_text(request)
+    {
         messages.push(openai_fallback_user_message(request));
         return messages;
     }
@@ -523,7 +560,7 @@ fn openai_messages(request: &ProviderRequest) -> Vec<serde_json::Value> {
 }
 
 fn openai_fallback_user_message(request: &ProviderRequest) -> serde_json::Value {
-    let input_text = input_text_with_tool_results(&request.input_text, &request.tool_results);
+    let input_text = input_text_with_tool_context(request);
     let mut content = vec![serde_json::json!({
         "type": "text",
         "text": input_text
@@ -546,6 +583,10 @@ fn openai_fallback_user_message(request: &ProviderRequest) -> serde_json::Value 
 
 fn should_fallback_to_text_tool_results(request: &ProviderRequest) -> bool {
     !request.tool_results.is_empty() && !messages_contain_tool_calls(&request.messages)
+}
+
+fn should_render_tool_history_as_text(request: &ProviderRequest) -> bool {
+    !request.tool_results.is_empty() && is_gemma_generation_model(&request.model)
 }
 
 fn messages_contain_tool_calls(messages: &[NormalizedMessage]) -> bool {
@@ -780,29 +821,50 @@ fn openai_tool_choice(choice: &ToolChoice) -> serde_json::Value {
     }
 }
 
-fn input_text_with_tool_results(input_text: &str, results: &[ToolResultRecord]) -> String {
-    if results.is_empty() {
-        return input_text.to_string();
+fn input_text_with_tool_context(request: &ProviderRequest) -> String {
+    let mut sections = Vec::new();
+    if !request.input_text.trim().is_empty() {
+        sections.push(request.input_text.clone());
     }
 
-    let result_lines = results
-        .iter()
-        .map(|result| {
-            format!(
-                "- tool_call_id={} status={:?} result={}",
-                result.tool_call_id.as_ref(),
-                result.status,
-                result.result_json
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if input_text.trim().is_empty() {
-        format!("Tool results available to the main agent:\n{result_lines}")
-    } else {
-        format!("{input_text}\n\nTool results available to the main agent:\n{result_lines}")
+    let mut tool_lines = Vec::new();
+    for message in &request.messages {
+        for part in &message.content {
+            if let NormalizedContentPart::ToolCall {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+            } = part
+            {
+                tool_lines.push(format!(
+                    "Tool call {} ({tool_name}) arguments:\n{}",
+                    tool_call_id.as_ref(),
+                    json_for_prompt(arguments_json)
+                ));
+            }
+        }
     }
+    for result in &request.tool_results {
+        tool_lines.push(format!(
+            "Tool result {} ({:?}):\n{}",
+            result.tool_call_id.as_ref(),
+            result.status,
+            json_for_prompt(&result.result_json)
+        ));
+    }
+
+    if !tool_lines.is_empty() {
+        sections.push(format!(
+            "Root-visible tool context observed so far:\n{}",
+            tool_lines.join("\n\n")
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn json_for_prompt(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn parse_structured_or_text(
@@ -810,13 +872,8 @@ fn parse_structured_or_text(
     task_id: &TaskId,
     content: &str,
 ) -> Option<AgentArtifact> {
-    let spawn_plan = serde_json::from_str::<serde_json::Value>(content)
-        .ok()
-        .filter(|value| value.get("type").and_then(|kind| kind.as_str()) == Some("spawn_plan"))
-        .and_then(|value| value.get("plan").cloned())
-        .and_then(|plan_value| serde_json::from_value::<SpawnPlan>(plan_value).ok());
-
-    if let Some(plan) = spawn_plan {
+    let content = strip_thinking_markup(content);
+    if let Some(plan) = parse_spawn_plan_from_content(&content) {
         return Some(AgentArtifact::SpawnPlan {
             id: ArtifactId::from(format!("spawn-plan-{}", task_id.as_ref())),
             scope: scope.clone(),
@@ -827,8 +884,201 @@ fn parse_structured_or_text(
     Some(AgentArtifact::Text {
         id: ArtifactId::from(format!("text-{}", task_id.as_ref())),
         scope: scope.clone(),
-        text: strip_thinking_markup(content),
+        text: content,
     })
+}
+
+fn parse_spawn_plan_from_content(content: &str) -> Option<SpawnPlan> {
+    let candidate = json_object_candidate(content)?;
+    let value = serde_json::from_str::<serde_json::Value>(&candidate).ok()?;
+    let plan_value = if let Some(plan) = value.get("plan").cloned() {
+        plan
+    } else if value.get("type").and_then(|kind| kind.as_str()) == Some("spawn_plan") {
+        serde_json::Value::Null
+    } else {
+        value
+    };
+
+    serde_json::from_value::<SpawnPlan>(plan_value.clone())
+        .ok()
+        .or_else(|| normalize_minimal_spawn_plan(plan_value))
+}
+
+fn json_object_candidate(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(after_fence) = trimmed.strip_prefix("```") {
+        let after_language = after_fence
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or(after_fence);
+        let fenced = after_language
+            .rsplit_once("```")
+            .map(|(before, _)| before)
+            .unwrap_or(after_language)
+            .trim();
+        if fenced.starts_with('{') {
+            return Some(fenced.to_string());
+        }
+    }
+
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed.to_string());
+    }
+
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (end > start).then(|| trimmed[start..=end].to_string())
+}
+
+fn normalize_minimal_spawn_plan(value: serde_json::Value) -> Option<SpawnPlan> {
+    let object = value.as_object()?;
+    let children_value = object.get("children")?.as_array()?;
+    let mut seen_ids = std::collections::BTreeSet::new();
+    let mut children = Vec::new();
+    for (index, child_value) in children_value.iter().enumerate() {
+        let Some(child) = normalize_minimal_child(child_value, index, &mut seen_ids) else {
+            continue;
+        };
+        children.push(child);
+    }
+
+    let max_tokens = AgentLimits::default()
+        .max_tokens
+        .saturating_mul(children.len().try_into().unwrap_or(u32::MAX));
+    Some(SpawnPlan {
+        parent_task_id: TaskId::from(
+            object
+                .get("parent_task_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("root"),
+        ),
+        reason: object
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("model selected child-agent division")
+            .to_string(),
+        children,
+        expected_artifacts: parse_artifact_kinds(object.get("expected_artifacts"))
+            .unwrap_or_else(|| vec![ArtifactKind::Text]),
+        budget_request: object
+            .get("budget_request")
+            .and_then(|value| serde_json::from_value::<BudgetRequest>(value.clone()).ok())
+            .unwrap_or(BudgetRequest {
+                max_tokens,
+                max_tool_calls: 0,
+            }),
+    })
+}
+
+fn normalize_minimal_child(
+    value: &serde_json::Value,
+    index: usize,
+    seen_ids: &mut std::collections::BTreeSet<String>,
+) -> Option<SubtaskSpec> {
+    let object = value.as_object()?;
+    let objective = object
+        .get("objective")
+        .or_else(|| object.get("task"))
+        .or_else(|| object.get("description"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let preferred_id = object
+        .get("task_id")
+        .or_else(|| object.get("id"))
+        .or_else(|| object.get("name"))
+        .and_then(|value| value.as_str())
+        .map(slugify_task_id)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slugify_task_id(&objective));
+    let task_id = unique_task_id(preferred_id, index, seen_ids);
+    let mut limits = object
+        .get("limits")
+        .and_then(|value| serde_json::from_value::<AgentLimits>(value.clone()).ok())
+        .unwrap_or_default();
+    limits.max_tool_calls = 0;
+
+    Some(SubtaskSpec {
+        task_id: TaskId::from(task_id),
+        parent_task_id: Some(TaskId::from(
+            object
+                .get("parent_task_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("root"),
+        )),
+        spawn_depth: object
+            .get("spawn_depth")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or(1),
+        role: object
+            .get("role")
+            .and_then(|value| serde_json::from_value::<AgentRole>(value.clone()).ok())
+            .unwrap_or(AgentRole::Worker),
+        objective,
+        input_artifact_refs: object
+            .get("input_artifact_refs")
+            .and_then(|value| serde_json::from_value::<Vec<ArtifactRef>>(value.clone()).ok())
+            .unwrap_or_default(),
+        expected_outputs: parse_artifact_kinds(object.get("expected_outputs"))
+            .unwrap_or_else(|| vec![ArtifactKind::Text]),
+        allowed_capabilities: object
+            .get("allowed_capabilities")
+            .and_then(|value| serde_json::from_value::<CapabilitySet>(value.clone()).ok())
+            .unwrap_or_else(|| CapabilitySet::from([Capability::Text])),
+        limits,
+    })
+}
+
+fn parse_artifact_kinds(value: Option<&serde_json::Value>) -> Option<Vec<ArtifactKind>> {
+    let kinds = value
+        .and_then(|value| serde_json::from_value::<Vec<ArtifactKind>>(value.clone()).ok())
+        .filter(|value| !value.is_empty())?;
+    Some(kinds)
+}
+
+fn slugify_task_id(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn unique_task_id(
+    mut preferred: String,
+    index: usize,
+    seen_ids: &mut std::collections::BTreeSet<String>,
+) -> String {
+    if preferred.is_empty() {
+        preferred = format!("worker-{:02}", index + 1);
+    }
+    if seen_ids.insert(preferred.clone()) {
+        return preferred;
+    }
+
+    let base = preferred;
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if seen_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 fn strip_thinking_markup(content: &str) -> String {
@@ -1192,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_payload_feeds_tool_results_back_without_recalling_tools() {
+    fn openai_payload_feeds_tool_results_back_and_keeps_tools_available() {
         let mut request = provider_request_with_media(MediaSource::DataUrl {
             data_url: "data:image/png;base64,AAAA".to_string(),
         });
@@ -1211,9 +1461,10 @@ mod tests {
 
         let body = OpenAiProvider::build_request_body(&request);
 
-        assert!(body.get("tools").is_none());
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup_weather");
+        assert_eq!(body["tool_choice"], "auto");
         let text = body["messages"][1]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Tool results available to the main agent"));
+        assert!(text.contains("Root-visible tool context observed so far"));
         assert!(text.contains("call-1"));
         assert!(text.contains("21C"));
     }
@@ -1224,6 +1475,11 @@ mod tests {
             data_url: "data:image/png;base64,AAAA".to_string(),
         });
         request.media_artifacts.clear();
+        request.tools = vec![ToolDefinition {
+            name: "lookup_weather".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
         request.messages = vec![
             NormalizedMessage {
                 role: MessageRole::User,
@@ -1256,6 +1512,8 @@ mod tests {
 
         let body = OpenAiProvider::build_request_body(&request);
 
+        assert_eq!(body["tools"][0]["function"]["name"], "lookup_weather");
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][2]["role"], "assistant");
         assert_eq!(
@@ -1270,6 +1528,62 @@ mod tests {
                 .unwrap()
                 .contains("21C")
         );
+    }
+
+    #[test]
+    fn openai_payload_renders_gemma_tool_history_as_text() {
+        let mut request = provider_request_with_media(MediaSource::DataUrl {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+        });
+        request.media_artifacts.clear();
+        request.model = "gemma-4-31b-it".to_string();
+        request.input_text = "inspect files".to_string();
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages = vec![
+            NormalizedMessage {
+                role: MessageRole::User,
+                content: vec![NormalizedContentPart::Text {
+                    text: "inspect files".to_string(),
+                }],
+            },
+            NormalizedMessage {
+                role: MessageRole::Assistant,
+                content: vec![NormalizedContentPart::ToolCall {
+                    tool_call_id: ToolCallId::from("call-1"),
+                    tool_name: "exec_command".to_string(),
+                    arguments_json: serde_json::json!({"cmd": "ls -la /app"}),
+                }],
+            },
+            NormalizedMessage {
+                role: MessageRole::Tool,
+                content: vec![NormalizedContentPart::ToolResult {
+                    tool_call_id: ToolCallId::from("call-1"),
+                }],
+            },
+        ];
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-1"),
+            scope: request.scope.clone(),
+            result_json: serde_json::json!({"stdout": "file.txt", "exit_code": 0}),
+            result_sha256: "hash".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+
+        let body = OpenAiProvider::build_request_body(&request);
+
+        assert_eq!(body["tools"][0]["function"]["name"], "exec_command");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][1]["role"], "user");
+        let text = body["messages"][1]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("inspect files"));
+        assert!(text.contains("Tool call call-1 (exec_command) arguments"));
+        assert!(text.contains("ls -la /app"));
+        assert!(text.contains("Tool result call-1"));
+        assert!(text.contains("file.txt"));
     }
 
     #[test]
@@ -1410,6 +1724,37 @@ mod tests {
             panic!("expected text artifact");
         };
         assert_eq!(text, "可直接給使用者的答案。");
+    }
+
+    #[test]
+    fn openai_response_parses_fenced_minimal_model_spawn_plan() {
+        let scope = IsolationKey::new("tenant", "request", "conversation");
+        let task_id = TaskId::from("root");
+        let response = OpenAiProvider::parse_response(
+            &scope,
+            &task_id,
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "```json\n{\"type\":\"spawn_plan\",\"plan\":{\"reason\":\"model selected concrete workers\",\"children\":[{\"task_id\":\"derive-encoder\",\"objective\":\"derive encoder from decomp.c\"},{\"objective\":\"verify generated data.comp by running the decompressor\"}]}}\n```"
+                    }
+                }]
+            }),
+        )
+        .unwrap();
+
+        let AgentArtifact::SpawnPlan { plan, .. } = &response.artifacts[0] else {
+            panic!("expected spawn plan artifact");
+        };
+        assert_eq!(plan.parent_task_id.as_ref(), "root");
+        assert_eq!(plan.children.len(), 2);
+        assert_eq!(plan.children[0].task_id.as_ref(), "derive-encoder");
+        assert_eq!(
+            plan.children[1].task_id.as_ref(),
+            "verify-generated-data-comp-by-running-the-decompressor"
+        );
+        assert_eq!(plan.children[0].role, AgentRole::Worker);
+        assert_eq!(plan.children[0].limits.max_tool_calls, 0);
     }
 
     #[test]

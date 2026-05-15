@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -12,6 +12,8 @@ use provider_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
+
+const MAX_ORCHESTRATION_REPAIR_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KernelError {
@@ -234,10 +236,6 @@ impl SpawnValidator {
             });
         }
 
-        if plan.budget_request.max_tool_calls > self.policy.limits.max_total_tool_calls {
-            return Err(KernelError::BudgetExceeded);
-        }
-
         for child in &plan.children {
             if child.spawn_depth > self.policy.limits.max_spawn_depth {
                 return Err(KernelError::SpawnDepthExceeded {
@@ -345,6 +343,16 @@ where
         let mut provider_call_count = 0_u32;
         let mut trace_events = Vec::new();
         let system_instructions = system_instructions_with_policy(&request, &request_policy);
+        let planner_provider_options =
+            planner_provider_options(&request.provider_options, &request_policy);
+        let internal_agent_provider_options = internal_agent_provider_options(
+            &request.provider_options,
+            u64::from(request_policy.limits.max_tokens_per_agent),
+        );
+        let agent_provider_options = provider_options_with_min_output_tokens(
+            &request.provider_options,
+            u64::from(request_policy.limits.max_tokens_per_agent),
+        );
 
         for media in &request.media_artifacts {
             store.insert(AgentArtifact::Media(media.clone()));
@@ -382,19 +390,9 @@ where
         let mut graph = TaskGraph::new(root_task_id.clone());
         graph.insert_task(root_task.clone());
 
-        if should_use_deterministic_orchestration(&request, &request_policy) {
-            if let Some(plan) =
-                deterministic_spawn_plan(&scope, &root_task_id, &request, &request_policy)
-            {
-                trace_events.push(KernelTraceEvent::SpawnPlan {
-                    task_id: root_task_id.clone(),
-                    reason: plan.reason.clone(),
-                    children: plan.children.clone(),
-                });
-                SpawnValidator::new(request_policy.clone())
-                    .validate_and_apply(&scope, &store, &mut graph, &plan)?;
-            }
-        } else {
+        let mut planning_issue = None;
+
+        if request.reasoning_effort.is_direct() {
             trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
             let root_response = self
                 .provider
@@ -428,6 +426,190 @@ where
                 &mut text_artifacts,
                 root_response,
             )?;
+        } else {
+            let mut root_preface_artifacts = Vec::new();
+
+            if should_run_root_tool_gate(&request) {
+                trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
+                let root_response = self
+                    .provider
+                    .invoke(ProviderRequest {
+                        scope: scope.clone(),
+                        task: root_task.clone(),
+                        model: request.model.clone(),
+                        system_instructions: system_instructions.clone(),
+                        thinking_enabled: request.thinking_enabled,
+                        thinking_format: request.thinking_format.clone(),
+                        input_text: flatten_text(&request),
+                        messages: request.messages.clone(),
+                        media_artifacts: request.media_artifacts.clone(),
+                        artifacts: Vec::new(),
+                        tools: request.tools.clone(),
+                        tool_choice: request.tool_choice.clone(),
+                        parallel_tool_calls: request.parallel_tool_calls,
+                        tool_results: request.tool_results.clone(),
+                        provider_options: request.provider_options.clone(),
+                    })
+                    .await?;
+                accumulate_usage(&mut usage, &mut provider_call_count, &root_response);
+                trace_events.extend(trace_events_from_response(&root_task, &root_response));
+
+                Self::apply_provider_response(
+                    &request_policy,
+                    &scope,
+                    &mut store,
+                    &mut ledger,
+                    &mut graph,
+                    &mut root_preface_artifacts,
+                    root_response,
+                )?;
+            }
+
+            let root_has_unresolved_tools = !ledger
+                .unresolved_calls_for_task(&scope, &root_task_id)
+                .is_empty();
+
+            let graph_has_children = graph
+                .tasks
+                .values()
+                .any(|task| task.parent_task_id.is_some());
+
+            if !root_has_unresolved_tools
+                && !graph_has_children
+                && should_use_model_orchestration(&request, &request_policy)
+            {
+                let planner_task = orchestration_planner_task(&root_task_id, &request_policy);
+                let planner_input = orchestration_planner_input(&request, &request_policy);
+                trace_events.push(trace_agent_input(&planner_task, planner_input.clone()));
+                let mut planner_response = self
+                    .provider
+                    .invoke(ProviderRequest {
+                        scope: scope.clone(),
+                        task: planner_task.clone(),
+                        model: request.model.clone(),
+                        system_instructions: system_instructions.clone(),
+                        thinking_enabled: request.thinking_enabled,
+                        thinking_format: request.thinking_format.clone(),
+                        input_text: planner_input,
+                        messages: Vec::new(),
+                        media_artifacts: request.media_artifacts.clone(),
+                        artifacts: Vec::new(),
+                        tools: Vec::new(),
+                        tool_choice: ToolChoice::None,
+                        parallel_tool_calls: None,
+                        tool_results: Vec::new(),
+                        provider_options: planner_provider_options.clone(),
+                    })
+                    .await?;
+                accumulate_usage(&mut usage, &mut provider_call_count, &planner_response);
+                trace_events.extend(trace_events_from_response(&planner_task, &planner_response));
+                let mut plan_coverage = planner_coverage(&planner_response);
+                let mut repair_attempts = 0_usize;
+                while should_repair_orchestration_plan(&plan_coverage, &request_policy)
+                    && repair_attempts < MAX_ORCHESTRATION_REPAIR_ATTEMPTS
+                {
+                    let repair_task =
+                        orchestration_planner_repair_task(&root_task_id, &request_policy);
+                    let repair_input = orchestration_planner_repair_input(
+                        &request,
+                        &request_policy,
+                        &planner_response,
+                        repair_attempts + 1,
+                    );
+                    trace_events.push(trace_agent_input(&repair_task, repair_input.clone()));
+                    let repair_response = self
+                        .provider
+                        .invoke(ProviderRequest {
+                            scope: scope.clone(),
+                            task: repair_task.clone(),
+                            model: request.model.clone(),
+                            system_instructions: system_instructions.clone(),
+                            thinking_enabled: request.thinking_enabled,
+                            thinking_format: request.thinking_format.clone(),
+                            input_text: repair_input,
+                            messages: Vec::new(),
+                            media_artifacts: request.media_artifacts.clone(),
+                            artifacts: Vec::new(),
+                            tools: Vec::new(),
+                            tool_choice: ToolChoice::None,
+                            parallel_tool_calls: None,
+                            tool_results: Vec::new(),
+                            provider_options: planner_provider_options.clone(),
+                        })
+                        .await?;
+                    accumulate_usage(&mut usage, &mut provider_call_count, &repair_response);
+                    trace_events.extend(trace_events_from_response(&repair_task, &repair_response));
+                    let repair_coverage = planner_coverage(&repair_response);
+                    planner_response = repair_response;
+                    plan_coverage = repair_coverage;
+                    repair_attempts += 1;
+                }
+                if should_repair_orchestration_plan(&plan_coverage, &request_policy) {
+                    return Err(KernelError::ProviderRejected(format!(
+                        "model orchestration returned {} child agent(s); reasoning effort {} requires exactly {} child agent(s); refusing root-only fallback",
+                        plan_coverage.child_count,
+                        reasoning_effort_name(&request.reasoning_effort),
+                        request_policy.limits.max_agents_per_request
+                    )));
+                }
+                let plan_seen = Self::apply_spawn_plan_response(
+                    &request_policy,
+                    &scope,
+                    &mut store,
+                    &mut graph,
+                    planner_response,
+                )?;
+                if !plan_seen {
+                    planning_issue = Some(VerificationIssue {
+                        code: "missing_model_spawn_plan".to_string(),
+                        message: "model orchestration did not return a valid structured spawn_plan"
+                            .to_string(),
+                    });
+                }
+            }
+
+            let graph_has_children = graph
+                .tasks
+                .values()
+                .any(|task| task.parent_task_id.is_some());
+            if !root_has_unresolved_tools && !graph_has_children {
+                if root_preface_artifacts.is_empty() {
+                    trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
+                    let root_response = self
+                        .provider
+                        .invoke(ProviderRequest {
+                            scope: scope.clone(),
+                            task: root_task.clone(),
+                            model: request.model.clone(),
+                            system_instructions: system_instructions.clone(),
+                            thinking_enabled: request.thinking_enabled,
+                            thinking_format: request.thinking_format.clone(),
+                            input_text: flatten_text(&request),
+                            messages: request.messages.clone(),
+                            media_artifacts: request.media_artifacts.clone(),
+                            artifacts: Vec::new(),
+                            tools: request.tools.clone(),
+                            tool_choice: request.tool_choice.clone(),
+                            parallel_tool_calls: request.parallel_tool_calls,
+                            tool_results: request.tool_results.clone(),
+                            provider_options: request.provider_options.clone(),
+                        })
+                        .await?;
+                    accumulate_usage(&mut usage, &mut provider_call_count, &root_response);
+                    trace_events.extend(trace_events_from_response(&root_task, &root_response));
+                    Self::apply_provider_response(
+                        &request_policy,
+                        &scope,
+                        &mut store,
+                        &mut ledger,
+                        &mut graph,
+                        &mut text_artifacts,
+                        root_response,
+                    )?;
+                } else {
+                    text_artifacts.extend(root_preface_artifacts);
+                }
+            }
         }
 
         let tasks: Vec<SubtaskSpec> = graph
@@ -467,7 +649,7 @@ where
                     tool_choice: ToolChoice::None,
                     parallel_tool_calls: None,
                     tool_results: Vec::new(),
-                    provider_options: request.provider_options.clone(),
+                    provider_options: internal_agent_provider_options.clone(),
                 };
                 (index, task, input_text, request)
             })
@@ -509,17 +691,79 @@ where
             )?;
         }
 
-        let root_unresolved: Vec<ToolCallId> = ledger
+        let mut root_unresolved: Vec<ToolCallId> = ledger
             .unresolved_calls_for_task(&scope, &root_task_id)
             .into_iter()
             .map(|call| call.tool_call_id.clone())
             .collect();
 
-        let public_tool_calls: Vec<ToolCallRecord> = ledger
+        let mut public_tool_calls: Vec<ToolCallRecord> = ledger
             .unresolved_calls_for_task(&scope, &root_task_id)
             .into_iter()
             .cloned()
             .collect();
+
+        let mut root_continuation_artifacts = Vec::new();
+        if root_unresolved.is_empty()
+            && has_child_tasks
+            && !request.tools.is_empty()
+            && !request.tool_results.is_empty()
+        {
+            let root_continuation_task = SubtaskSpec {
+                objective: "continue root-visible tool execution from worker findings, or produce a final answer only when complete".to_string(),
+                ..root_task.clone()
+            };
+            let continuation_input = root_tool_continuation_input(&request, &text_artifacts);
+            trace_events.push(trace_agent_input(
+                &root_continuation_task,
+                continuation_input.clone(),
+            ));
+            let continuation_response = self
+                .provider
+                .invoke(ProviderRequest {
+                    scope: scope.clone(),
+                    task: root_continuation_task.clone(),
+                    model: request.model.clone(),
+                    system_instructions: system_instructions.clone(),
+                    thinking_enabled: request.thinking_enabled,
+                    thinking_format: request.thinking_format.clone(),
+                    input_text: continuation_input,
+                    messages: request.messages.clone(),
+                    media_artifacts: request.media_artifacts.clone(),
+                    artifacts: text_artifacts.clone(),
+                    tools: request.tools.clone(),
+                    tool_choice: request.tool_choice.clone(),
+                    parallel_tool_calls: request.parallel_tool_calls,
+                    tool_results: request.tool_results.clone(),
+                    provider_options: internal_agent_provider_options.clone(),
+                })
+                .await?;
+            accumulate_usage(&mut usage, &mut provider_call_count, &continuation_response);
+            trace_events.extend(trace_events_from_response(
+                &root_continuation_task,
+                &continuation_response,
+            ));
+            Self::apply_provider_response(
+                &request_policy,
+                &scope,
+                &mut store,
+                &mut ledger,
+                &mut graph,
+                &mut root_continuation_artifacts,
+                continuation_response,
+            )?;
+
+            root_unresolved = ledger
+                .unresolved_calls_for_task(&scope, &root_task_id)
+                .into_iter()
+                .map(|call| call.tool_call_id.clone())
+                .collect();
+            public_tool_calls = ledger
+                .unresolved_calls_for_task(&scope, &root_task_id)
+                .into_iter()
+                .cloned()
+                .collect();
+        }
 
         if request.public_reasoning_enabled && root_unresolved.is_empty() && has_child_tasks {
             let summary_task = SubtaskSpec {
@@ -554,14 +798,16 @@ where
                     tool_choice: ToolChoice::None,
                     parallel_tool_calls: None,
                     tool_results: Vec::new(),
-                    provider_options: request.provider_options.clone(),
+                    provider_options: agent_provider_options.clone(),
                 })
                 .await?;
             accumulate_usage(&mut usage, &mut provider_call_count, &summary_response);
             trace_events.extend(trace_events_from_response(&summary_task, &summary_response));
         }
 
-        let final_text = if root_unresolved.is_empty() && has_child_tasks {
+        let final_text = if root_unresolved.is_empty() && !root_continuation_artifacts.is_empty() {
+            synthesize_text(&root_continuation_artifacts)
+        } else if root_unresolved.is_empty() && has_child_tasks {
             let synth_task = SubtaskSpec {
                 task_id: TaskId::from("synthesizer"),
                 parent_task_id: Some(root_task_id.clone()),
@@ -593,7 +839,7 @@ where
                     tool_choice: ToolChoice::None,
                     parallel_tool_calls: None,
                     tool_results: Vec::new(),
-                    provider_options: request.provider_options.clone(),
+                    provider_options: agent_provider_options.clone(),
                 })
                 .await?;
             accumulate_usage(&mut usage, &mut provider_call_count, &synth_response);
@@ -618,9 +864,15 @@ where
                 message: "tool calls must be resolved before final synthesis".to_string(),
             });
         }
+        if let Some(issue) = planning_issue {
+            issues.push(issue);
+        }
+        let passed = !issues
+            .iter()
+            .any(|issue| issue.code != "missing_model_spawn_plan");
         let verification = VerificationReport {
             request_id: request.request_id.clone(),
-            passed: issues.is_empty(),
+            passed,
             issues,
             artifact_coverage: text_artifacts
                 .iter()
@@ -720,6 +972,32 @@ where
         Ok(())
     }
 
+    fn apply_spawn_plan_response(
+        policy: &KernelPolicy,
+        scope: &IsolationKey,
+        store: &mut ArtifactStore,
+        graph: &mut TaskGraph,
+        response: ProviderResponse,
+    ) -> Result<bool, KernelError> {
+        let mut saw_plan = false;
+        let mut plans = Vec::new();
+        for artifact in response.artifacts {
+            match artifact {
+                AgentArtifact::SpawnPlan { plan, .. } => {
+                    saw_plan = true;
+                    plans.push(plan);
+                }
+                other => {
+                    store.insert(other);
+                }
+            }
+        }
+        for plan in plans {
+            SpawnValidator::new(policy.clone()).validate_and_apply(scope, store, graph, &plan)?;
+        }
+        Ok(saw_plan)
+    }
+
     fn seal_subagent_state(
         &self,
         scope: &IsolationKey,
@@ -812,6 +1090,12 @@ impl ModelProvider for MockProvider {
             });
         }
 
+        if request.task.role == AgentRole::Leader
+            && request.task.objective.contains("orchestration plan")
+        {
+            return mock_spawn_plan_response(request);
+        }
+
         if request.task.role == AgentRole::Leader && request.input_text.contains("tool") {
             return Ok(ProviderResponse {
                 artifacts: Vec::new(),
@@ -832,52 +1116,23 @@ impl ModelProvider for MockProvider {
         }
 
         if request.task.role == AgentRole::Leader && request.input_text.contains("spawn") {
-            let image_ref = request
-                .media_artifacts
-                .first()
-                .map(|media| ArtifactRef {
-                    scope: request.scope.clone(),
-                    artifact_id: media.id.clone(),
-                })
-                .into_iter()
-                .collect();
-            let child = SubtaskSpec {
-                task_id: TaskId::from("child-1"),
-                parent_task_id: Some(request.task.task_id.clone()),
-                spawn_depth: request.task.spawn_depth.saturating_add(1),
-                role: AgentRole::Worker,
-                objective: "child visual inspection".to_string(),
-                input_artifact_refs: image_ref,
-                expected_outputs: vec![ArtifactKind::Text],
-                allowed_capabilities: CapabilitySet::from([Capability::Text, Capability::Image]),
-                limits: AgentLimits::default(),
-            };
-            return Ok(ProviderResponse {
-                artifacts: vec![AgentArtifact::SpawnPlan {
-                    id: ArtifactId::from("spawn-plan-1"),
-                    scope: request.scope.clone(),
-                    plan: SpawnPlan {
-                        parent_task_id: request.task.task_id,
-                        reason: "Need bounded child inspection".to_string(),
-                        children: vec![child],
-                        expected_artifacts: vec![ArtifactKind::Text],
-                        budget_request: BudgetRequest {
-                            max_tokens: 256,
-                            max_tool_calls: 0,
-                        },
-                    },
-                }],
-                tool_calls: Vec::new(),
-                usage: Default::default(),
-            });
+            return mock_spawn_plan_response(request);
         }
 
         let text = match request.task.role {
+            AgentRole::Worker
+                if request
+                    .input_text
+                    .contains("Root-visible tool context observed so far:") =>
+            {
+                format!(
+                    "child completed: {}\n{}",
+                    request.task.objective, request.input_text
+                )
+            }
             AgentRole::Worker => format!("child completed: {}", request.task.objective),
             AgentRole::ReasoningSummarizer => mock_reasoning_summary(&request.input_text),
-            AgentRole::Synthesizer => {
-                "Here is a clear, usable answer based on the verified agent results.".to_string()
-            }
+            AgentRole::Synthesizer => mock_synthesis_text(&request.input_text),
             _ => format!("Here is a clear, usable answer: {}", request.input_text),
         };
 
@@ -891,6 +1146,66 @@ impl ModelProvider for MockProvider {
             usage: Default::default(),
         })
     }
+}
+
+fn mock_spawn_plan_response(request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+    let target = target_child_agents(&request);
+    let image_ref: Vec<ArtifactRef> = request
+        .media_artifacts
+        .first()
+        .map(|media| ArtifactRef {
+            scope: request.scope.clone(),
+            artifact_id: media.id.clone(),
+        })
+        .into_iter()
+        .collect();
+    let children = (0..target)
+        .map(|index| SubtaskSpec {
+            task_id: TaskId::from(format!("child-{index:02}")),
+            parent_task_id: Some(TaskId::from("root")),
+            spawn_depth: 1,
+            role: AgentRole::Worker,
+            objective: format!("child visual inspection slice {index}"),
+            input_artifact_refs: image_ref.clone(),
+            expected_outputs: vec![ArtifactKind::Text],
+            allowed_capabilities: CapabilitySet::from([Capability::Text, Capability::Image]),
+            limits: AgentLimits::default(),
+        })
+        .collect();
+    Ok(ProviderResponse {
+        artifacts: vec![AgentArtifact::SpawnPlan {
+            id: ArtifactId::from("spawn-plan-1"),
+            scope: request.scope.clone(),
+            plan: SpawnPlan {
+                parent_task_id: TaskId::from("root"),
+                reason: "Need bounded child inspection".to_string(),
+                children,
+                expected_artifacts: vec![ArtifactKind::Text],
+                budget_request: BudgetRequest {
+                    max_tokens: 256,
+                    max_tool_calls: 0,
+                },
+            },
+        }],
+        tool_calls: Vec::new(),
+        usage: Default::default(),
+    })
+}
+
+fn mock_synthesis_text(input_text: &str) -> String {
+    if input_text.contains("Root-visible tool context observed so far:") {
+        return format!(
+            "Here is a clear, usable answer based on the verified agent results.\n{}",
+            input_text
+        );
+    }
+    input_text
+        .lines()
+        .find(|line| line.contains("Here is a clear, usable answer from tool results:"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            "Here is a clear, usable answer based on the verified agent results.".to_string()
+        })
 }
 
 fn mock_reasoning_summary(input_text: &str) -> String {
@@ -947,13 +1262,22 @@ fn system_instructions_with_policy(
         &request.reasoning_effort,
         policy,
     ));
+    if !request.tools.is_empty() {
+        instructions.push(
+            "Tool execution policy: child agents cannot call client tools. When the task needs \
+             commands, file edits, retrieval, or more observation after a tool result, the root \
+             leader must emit the next root-visible tool call instead of finalizing with a plan. \
+             Continue the tool loop until the requested work is actually complete."
+                .to_string(),
+        );
+    }
     instructions
 }
 
 fn orchestration_policy_instruction(effort: &ReasoningEffort, policy: &KernelPolicy) -> String {
     let max_agents = policy.limits.max_agents_per_request;
     format!(
-        "Orchestration policy: reasoning_effort={}; max_agents_per_request={max_agents}; max_parallel_agents={}; target_parallel_agents={max_agents}; max_spawn_depth={}; max_total_tool_calls={}; token_accounting_reference={}. For complex or ambiguous tasks, use deterministic decomposition and spawn up to target_parallel_agents independent child agents when that increases coverage. max_parallel_agents is only the concurrent backend request limit, not the child-agent count. Token accounting is telemetry only and must not suppress child-agent execution or reduce final answer quality. Low should stay compact; medium/high/xhigh should broaden coverage and verification. Only root-visible tool calls and the final synthesis are public.",
+        "Orchestration policy: reasoning_effort={}; max_agents_per_request={max_agents}; max_parallel_agents={}; target_parallel_agents={max_agents}; max_spawn_depth={}; max_total_tool_calls={}; token_accounting_reference={}. Multi-agent decomposition must be model-selected from the actual task context, not a generic template. For non-direct reasoning, target_parallel_agents is the required child-agent count; empty or under-target spawn plans are rejected instead of falling back to root-only execution. max_parallel_agents is only the concurrent backend request limit, not the child-agent count. Token accounting is telemetry only and must not suppress child-agent execution or reduce final answer quality. Low should stay compact; medium/high/xhigh should broaden coverage and verification. Only root-visible tool calls and the final synthesis are public.",
         reasoning_effort_name(effort),
         policy.limits.max_parallel_agents,
         policy.limits.max_spawn_depth,
@@ -972,112 +1296,302 @@ fn reasoning_effort_name(effort: &ReasoningEffort) -> &'static str {
     }
 }
 
-fn should_use_deterministic_orchestration(
-    request: &NormalizedRequest,
-    policy: &KernelPolicy,
-) -> bool {
-    !request.reasoning_effort.is_direct()
-        && policy.limits.max_agents_per_request > 1
-        && request.tools.is_empty()
-        && request.tool_results.is_empty()
+fn should_run_root_tool_gate(request: &NormalizedRequest) -> bool {
+    !request.tools.is_empty() && request.tool_results.is_empty()
 }
 
-fn deterministic_spawn_plan(
-    scope: &IsolationKey,
-    root_task_id: &TaskId,
-    request: &NormalizedRequest,
-    policy: &KernelPolicy,
-) -> Option<SpawnPlan> {
-    let child_count = policy.limits.max_agents_per_request;
-    if child_count == 0 {
-        return None;
+fn should_use_model_orchestration(request: &NormalizedRequest, policy: &KernelPolicy) -> bool {
+    !request.reasoning_effort.is_direct() && policy.limits.max_agents_per_request > 1
+}
+
+fn target_child_agents(request: &ProviderRequest) -> usize {
+    request
+        .task
+        .objective
+        .split("exactly ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| {
+            request
+                .system_instructions
+                .iter()
+                .flat_map(|instruction| instruction.split([';', '\n']))
+                .filter_map(|part| part.trim().strip_prefix("target_parallel_agents="))
+                .filter_map(|value| value.parse::<usize>().ok())
+                .next()
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn provider_options_with_min_output_tokens(
+    options: &serde_json::Value,
+    min_tokens: u64,
+) -> serde_json::Value {
+    let mut options = options.clone();
+    let Some(object) = options.as_object_mut() else {
+        return options;
+    };
+
+    let mut saw_limit = false;
+    for key in OUTPUT_LIMIT_KEYS {
+        if object.contains_key(key) {
+            saw_limit = true;
+            raise_output_token_limit(object, key, min_tokens);
+        }
+    }
+    if !saw_limit {
+        object.insert("max_tokens".to_string(), json!(min_tokens));
     }
 
-    let media_refs = request
-        .media_artifacts
-        .iter()
-        .map(|media| ArtifactRef {
-            scope: scope.clone(),
-            artifact_id: media.id.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let children = (0..child_count)
-        .map(|index| {
-            let objective = deterministic_child_objective(index, request, child_count);
-            let allowed_capabilities = if media_refs.is_empty() {
-                CapabilitySet::from([Capability::Text])
-            } else {
-                CapabilitySet::from([Capability::Text, Capability::Image])
-            };
-            SubtaskSpec {
-                task_id: TaskId::from(format!("deterministic-child-{:02}", index + 1)),
-                parent_task_id: Some(root_task_id.clone()),
-                spawn_depth: 1,
-                role: AgentRole::Worker,
-                objective,
-                input_artifact_refs: media_refs.clone(),
-                expected_outputs: vec![ArtifactKind::Text],
-                allowed_capabilities,
-                limits: AgentLimits {
-                    max_tokens: policy.limits.max_tokens_per_agent,
-                    max_tool_calls: 0,
-                    timeout_ms: policy.limits.agent_timeout_ms,
-                },
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let requested_tokens = policy
-        .limits
-        .max_tokens_per_agent
-        .saturating_mul(u32::from(child_count));
-
-    Some(SpawnPlan {
-        parent_task_id: root_task_id.clone(),
-        reason: format!(
-            "deterministic orchestration for {} with {} bounded parallel child agent(s)",
-            reasoning_effort_name(&request.reasoning_effort),
-            child_count
-        ),
-        children,
-        expected_artifacts: vec![ArtifactKind::Text],
-        budget_request: BudgetRequest {
-            max_tokens: requested_tokens,
-            max_tool_calls: 0,
-        },
-    })
+    options
 }
 
-fn deterministic_child_objective(
-    index: u16,
-    request: &NormalizedRequest,
-    child_count: u16,
-) -> String {
-    let has_images = !request.media_artifacts.is_empty();
-    let focus = match index {
-        0 if has_images => "inspect multimodal inputs and extract salient visual details",
-        0 => "analyze the user request, intent, constraints, and required answer shape",
-        1 => "produce an independent solution draft focused on correctness and completeness",
-        2 => "verify assumptions, edge cases, consistency, and possible failure modes",
-        3 => "preserve user-facing formatting, naturalness, and final answer usability",
-        _ => "cover an additional independent reasoning shard for breadth and verification",
+const OUTPUT_LIMIT_KEYS: [&str; 5] = [
+    "max_tokens",
+    "max_completion_tokens",
+    "max_new_tokens",
+    "n_predict",
+    "num_predict",
+];
+
+fn internal_agent_provider_options(
+    options: &serde_json::Value,
+    min_tokens: u64,
+) -> serde_json::Value {
+    let mut options = strip_internal_stop_conditions(options);
+    options = provider_options_with_min_output_tokens(&options, min_tokens);
+    options
+}
+
+fn strip_internal_stop_conditions(options: &serde_json::Value) -> serde_json::Value {
+    let mut options = options.clone();
+    if let Some(object) = options.as_object_mut() {
+        object.remove("stop");
+        object.remove("stopping_strings");
+    }
+    options
+}
+
+fn planner_provider_options(
+    options: &serde_json::Value,
+    policy: &KernelPolicy,
+) -> serde_json::Value {
+    let mut options = internal_agent_provider_options(options, planner_output_token_floor(policy));
+    if let Some(object) = options.as_object_mut() {
+        object.insert("temperature".to_string(), json!(0));
+        object.insert(
+            "response_format".to_string(),
+            json!({
+                "type": "json_object"
+            }),
+        );
+    }
+    options
+}
+
+fn raise_output_token_limit(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    min_tokens: u64,
+) {
+    let should_raise = match object.get(key) {
+        Some(serde_json::Value::Number(number)) => {
+            number.as_u64().is_some_and(|value| value < min_tokens)
+        }
+        Some(serde_json::Value::String(text)) => text
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|value| value < min_tokens),
+        Some(serde_json::Value::Null) | None => true,
+        _ => false,
+    };
+    if should_raise {
+        object.insert(key.to_string(), json!(min_tokens));
+    }
+}
+
+fn planner_output_token_floor(policy: &KernelPolicy) -> u64 {
+    u64::from(policy.limits.max_tokens_per_agent)
+        .max(u64::from(policy.limits.max_agents_per_request).saturating_mul(128))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannerCoverage {
+    saw_plan: bool,
+    child_count: usize,
+}
+
+fn planner_coverage(response: &ProviderResponse) -> PlannerCoverage {
+    let mut saw_plan = false;
+    let mut child_count = 0_usize;
+    for artifact in &response.artifacts {
+        if let AgentArtifact::SpawnPlan { plan, .. } = artifact {
+            saw_plan = true;
+            child_count = child_count.saturating_add(plan.children.len());
+        }
+    }
+    PlannerCoverage {
+        saw_plan,
+        child_count,
+    }
+}
+
+fn should_repair_orchestration_plan(coverage: &PlannerCoverage, policy: &KernelPolicy) -> bool {
+    let target = usize::from(policy.limits.max_agents_per_request);
+    target > 1 && (!coverage.saw_plan || coverage.child_count < target)
+}
+
+fn orchestration_planner_task(root_task_id: &TaskId, policy: &KernelPolicy) -> SubtaskSpec {
+    SubtaskSpec {
+        task_id: root_task_id.clone(),
+        parent_task_id: None,
+        spawn_depth: 0,
+        role: AgentRole::Leader,
+        objective: format!(
+            "produce a bounded model-selected orchestration plan with exactly {} child agents",
+            policy.limits.max_agents_per_request
+        ),
+        input_artifact_refs: Vec::new(),
+        expected_outputs: vec![ArtifactKind::SpawnPlan],
+        allowed_capabilities: CapabilitySet::from([
+            Capability::Text,
+            Capability::Image,
+            Capability::Spawn,
+        ]),
+        limits: AgentLimits {
+            max_tokens: policy.limits.max_tokens_per_agent,
+            max_tool_calls: 0,
+            timeout_ms: policy.limits.agent_timeout_ms,
+        },
+    }
+}
+
+fn orchestration_planner_repair_task(root_task_id: &TaskId, policy: &KernelPolicy) -> SubtaskSpec {
+    SubtaskSpec {
+        objective: format!(
+            "repair a bounded model-selected orchestration plan with exactly {} child agents",
+            policy.limits.max_agents_per_request
+        ),
+        ..orchestration_planner_task(root_task_id, policy)
+    }
+}
+
+fn orchestration_planner_input(request: &NormalizedRequest, policy: &KernelPolicy) -> String {
+    let context = agent_visible_context(request);
+    let media_note = if request.media_artifacts.is_empty() {
+        "No image artifacts are attached.".to_string()
+    } else {
+        format!(
+            "{} image artifact(s) are attached; assign visual inspection only when needed.",
+            request.media_artifacts.len()
+        )
     };
     format!(
-        "Deterministic child {}/{}: {}. Return concise structured findings only; do not call client tools.",
-        index + 1,
-        child_count,
-        focus
+        "You are the commercial orchestration planner for this single API request.\n\
+         Decide the child-agent division from the actual task, tool results, media, and user constraints.\n\
+         Return ONLY valid JSON. Do not write prose, markdown, questions, or a final answer.\n\
+         This request is not direct mode: children length MUST be exactly {max_agents}. Empty or fewer children is an invalid API contract.\n\
+         The model decides each worker's task-specific objective, but the kernel enforces the configured child-agent count.\n\
+         Child objectives must be task-specific, non-overlapping, outcome-oriented, and directly useful for final synthesis.\n\
+         Keep each child objective short, ideally 12 words or fewer, so the spawn_plan remains compact.\n\
+         Avoid generic objectives such as \"analyze the request\" unless that is the actual work product.\n\
+         If client tools are needed, assign workers to analyze current evidence and propose next root-visible tool actions; workers cannot call client tools.\n\
+         Do not ask the user whether to proceed; assign workers to make progress and verify.\n\n\
+         Hard limits enforced by the kernel:\n\
+         - parent_task_id must be \"root\"\n\
+         - children length must be exactly {max_agents}\n\
+         - max_parallel_agents={max_parallel}; this is concurrency only, not the number of children\n\
+         - child agents cannot call tools; the kernel fills worker/text-only defaults when optional child fields are omitted\n\n\
+         Return this compact JSON shape. The children array shown must contain exactly {max_agents} objects:\n\
+         {{\n\
+           \"type\": \"spawn_plan\",\n\
+           \"plan\": {{\n\
+             \"parent_task_id\": \"root\",\n\
+             \"reason\": \"why these child agents improve the answer\",\n\
+             \"children\": [\n\
+               {{\"task_id\":\"short-stable-kebab-case-id-01\",\"objective\":\"specific work this child must complete\"}}\n\
+             ]\n\
+           }}\n\
+         }}\n\n\
+         Media context: {media_note}\n\n\
+         Request context:\n{context}",
+        max_agents = policy.limits.max_agents_per_request,
+        max_parallel = policy.limits.max_parallel_agents,
     )
 }
 
+fn orchestration_planner_repair_input(
+    request: &NormalizedRequest,
+    policy: &KernelPolicy,
+    previous_response: &ProviderResponse,
+    attempt: usize,
+) -> String {
+    let previous = planner_attempt_summary(previous_response);
+    let context = agent_visible_context(request);
+    format!(
+        "You are repairing the orchestration plan for this same single API request.\n\
+         Repair attempt: {attempt}/{max_attempts}.\n\
+         Previous orchestration attempt:\n{previous}\n\n\
+         The previous attempt was missing, empty, or below the configured coverage tier.\n\
+         Return ONLY valid JSON for one complete replacement spawn_plan. The kernel will apply only this repaired plan.\n\
+         Keep the division model-selected and task-specific; do not use generic template workers.\n\
+         Keep each child objective short, ideally 12 words or fewer.\n\
+         target_child_agents={target}; max_agents_per_request={target}; max_parallel_agents={max_parallel}.\n\
+         children length MUST be exactly {target}. Empty or fewer children is invalid and will be rejected; do not answer with root-only work.\n\
+         Child agents cannot call client tools; if tools are needed, assign workers to analyze evidence and let the root leader make root-visible tool calls later.\n\n\
+         Required compact JSON shape: {{\"type\":\"spawn_plan\",\"plan\":{{\"parent_task_id\":\"root\",\"reason\":\"...\",\"children\":[{{\"task_id\":\"child-01\",\"objective\":\"specific worker objective\"}}]}}}}. The children array must contain exactly {target} objects.\n\n\
+         Request context:\n{context}",
+        target = policy.limits.max_agents_per_request,
+        max_parallel = policy.limits.max_parallel_agents,
+        max_attempts = MAX_ORCHESTRATION_REPAIR_ATTEMPTS,
+    )
+}
+
+fn planner_attempt_summary(response: &ProviderResponse) -> String {
+    let mut lines = Vec::new();
+    for artifact in &response.artifacts {
+        match artifact {
+            AgentArtifact::SpawnPlan { plan, .. } => {
+                lines.push(format!(
+                    "spawn_plan reason: {}; children: {}",
+                    plan.reason,
+                    plan.children.len()
+                ));
+                for child in &plan.children {
+                    lines.push(format!("- {}: {}", child.task_id.as_ref(), child.objective));
+                }
+            }
+            AgentArtifact::Text { text, .. } => {
+                let text = text.trim();
+                if !text.is_empty() {
+                    lines.push(format!("non-JSON planner text: {text}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        "No spawn_plan artifact was returned.".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 fn child_agent_input(request: &NormalizedRequest, task: &SubtaskSpec) -> String {
-    let original = flatten_text(request);
+    let original = agent_visible_context(request);
+    let contract = "Worker artifact contract:\n\
+        - Return a compact intermediate artifact, not a chat transcript.\n\
+        - You do not have tool access in this worker turn; do not request, invent, or simulate tool calls.\n\
+        - Do not say you will inspect files, run commands, browse, or write code unless the evidence is already present in the root-visible context.\n\
+        - Focus only on this child objective. Prefer concrete findings, constraints, risks, and the next root-visible action if one is needed.\n\
+        - Keep the artifact concise: at most 6 short bullets or one small JSON object. No hidden reasoning and no orchestration commentary.";
     if original.trim().is_empty() {
-        format!("Child objective:\n{}", task.objective)
+        format!("Child objective:\n{}\n\n{contract}", task.objective)
     } else {
         format!(
-            "Child objective:\n{}\n\nOriginal user request:\n{}",
+            "Child objective:\n{}\n\n{contract}\n\nOriginal request and root-visible context:\n{}",
             task.objective, original
         )
     }
@@ -1088,11 +1602,88 @@ fn synthesis_input(request: &NormalizedRequest, artifacts: &[AgentArtifact]) -> 
     synthesis_input_from_findings(request, &artifact_text)
 }
 
-fn synthesis_input_from_findings(request: &NormalizedRequest, artifact_text: &str) -> String {
-    let original = flatten_text(request);
+fn root_tool_continuation_input(
+    request: &NormalizedRequest,
+    artifacts: &[AgentArtifact],
+) -> String {
+    let original = agent_visible_context(request);
+    let artifact_text = synthesize_text(artifacts);
     format!(
-        "User request:\n{original}\n\nSummarized verified worker-agent findings:\n{artifact_text}\n\nReturn only a complete, natural final answer for the user. Use the summarized findings as guidance, but do not shorten the answer just because the findings are concise. Do not expose sub-agent state, internal tool calls, raw artifacts, or orchestration details. Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections."
+        "User request and current root-visible tool context:\n{original}\n\nWorker-agent findings available to the root leader:\n{artifact_text}\n\nUse these findings to continue the task. If any command, file edit, retrieval, or verification is still needed, emit the next root-visible tool call now. Produce a final answer only when the requested work is actually complete."
     )
+}
+
+fn synthesis_input_from_findings(request: &NormalizedRequest, artifact_text: &str) -> String {
+    let original = agent_visible_context(request);
+    format!(
+        "User request and root-visible context:\n{original}\n\nSummarized verified worker-agent findings:\n{artifact_text}\n\nReturn only a complete, natural final answer for the user. Use the summarized findings as guidance, but do not shorten the answer just because the findings are concise. Do not expose sub-agent state, internal tool calls, raw artifacts, or orchestration details. Preserve formatting exactly when the answer contains XML/HTML-like tags, Markdown, fenced code, lists, tables, or delimiter-separated blocks. Do not minify, collapse line breaks, remove spaces around headings, or merge tag-delimited sections."
+    )
+}
+
+fn agent_visible_context(request: &NormalizedRequest) -> String {
+    let mut sections = Vec::new();
+    let original = flatten_text(request);
+    if !original.trim().is_empty() {
+        sections.push(original);
+    }
+
+    let tool_context = tool_context_text(request);
+    if !tool_context.trim().is_empty() {
+        sections.push(format!(
+            "Root-visible tool context observed so far:\n{tool_context}"
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
+fn tool_context_text(request: &NormalizedRequest) -> String {
+    let mut lines = Vec::new();
+    let result_ids = request
+        .tool_results
+        .iter()
+        .map(|result| result.tool_call_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    for message in &request.messages {
+        for part in &message.content {
+            match part {
+                NormalizedContentPart::ToolCall {
+                    tool_call_id,
+                    tool_name,
+                    arguments_json,
+                } => lines.push(format!(
+                    "Tool call {} ({tool_name}) arguments:\n{}",
+                    tool_call_id.as_ref(),
+                    json_for_prompt(arguments_json)
+                )),
+                NormalizedContentPart::ToolResult { tool_call_id }
+                    if !result_ids.contains(tool_call_id) =>
+                {
+                    lines.push(format!(
+                        "Tool result {} is present in the conversation.",
+                        tool_call_id.as_ref()
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for result in &request.tool_results {
+        lines.push(format!(
+            "Tool result {} ({:?}):\n{}",
+            result.tool_call_id.as_ref(),
+            result.status,
+            json_for_prompt(&result.result_json)
+        ));
+    }
+
+    lines.join("\n\n")
+}
+
+fn json_for_prompt(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn synthesize_text(artifacts: &[AgentArtifact]) -> String {
@@ -1563,6 +2154,268 @@ mod tests {
         assert!(graph.tasks.contains_key(&TaskId::from("child-image")));
     }
 
+    #[test]
+    fn spawn_plan_budget_request_is_advisory_not_a_hard_failure() {
+        let scope = IsolationKey::new("tenant", "request-a", "conversation");
+        let root = TaskId::from("root");
+        let store = ArtifactStore::new();
+        let mut graph = TaskGraph::new(root.clone());
+        let validator = SpawnValidator::new(KernelPolicy {
+            limits: ExecutionLimits {
+                max_total_tool_calls: 1,
+                ..ExecutionLimits::default()
+            },
+        });
+        let plan = SpawnPlan {
+            parent_task_id: root.clone(),
+            reason: "model requested more tool budget than policy permits".to_string(),
+            children: vec![model_child("child-a", "do bounded child work")],
+            expected_artifacts: vec![ArtifactKind::Text],
+            budget_request: BudgetRequest {
+                max_tokens: 64,
+                max_tool_calls: 999,
+            },
+        };
+
+        validator
+            .validate_and_apply(&scope, &store, &mut graph, &plan)
+            .unwrap();
+        assert!(graph.tasks.contains_key(&TaskId::from("child-a")));
+    }
+
+    #[tokio::test]
+    async fn model_orchestrator_decides_child_agent_division() {
+        let request = text_request(
+            "solve a compression task with independent planning, building, and verification",
+        );
+        let runner = KernelRunner::new(ModelPlanProvider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert!(
+            output
+                .task_graph
+                .tasks
+                .contains_key(&TaskId::from("inspect-format"))
+        );
+        assert!(
+            output
+                .task_graph
+                .tasks
+                .contains_key(&TaskId::from("build-candidate"))
+        );
+        assert!(
+            output
+                .task_graph
+                .tasks
+                .contains_key(&TaskId::from("verify-result"))
+        );
+        assert!(
+            !output
+                .task_graph
+                .tasks
+                .keys()
+                .any(|task_id| task_id.as_ref().starts_with("deterministic-child-"))
+        );
+        assert_eq!(output.final_text, "model planned synthesis complete");
+    }
+
+    #[tokio::test]
+    async fn tool_result_turn_returns_model_plan_findings_to_root_leader() {
+        let mut request =
+            text_request("create the required artifact from the observed command output");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Assistant,
+            content: vec![NormalizedContentPart::ToolCall {
+                tool_call_id: ToolCallId::from("call-read"),
+                tool_name: "exec_command".to_string(),
+                arguments_json: serde_json::json!({"cmd": "cat /app/decomp.c"}),
+            }],
+        });
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Tool,
+            content: vec![NormalizedContentPart::ToolResult {
+                tool_call_id: ToolCallId::from("call-read"),
+            }],
+        });
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-read"),
+            scope,
+            result_json: serde_json::json!({"stdout": "decompressor source", "exit_code": 0}),
+            result_sha256: "tool-result".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+        let provider = ToolResultModelPlanProvider::default();
+        let seen = provider.seen.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert_eq!(output.final_text, "leader pre-answer");
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|entry| entry.contains("planner saw tool result"))
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|entry| entry.contains("synthesizer had no leader pre-answer"))
+        );
+        assert!(
+            !output
+                .task_graph
+                .tasks
+                .keys()
+                .any(|task_id| task_id.as_ref().starts_with("deterministic-child-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_turn_orchestrates_worker_analysis_before_next_root_tool_call() {
+        let mut request =
+            text_request("inspect the command output and continue with the next command");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Assistant,
+            content: vec![NormalizedContentPart::ToolCall {
+                tool_call_id: ToolCallId::from("call-read"),
+                tool_name: "exec_command".to_string(),
+                arguments_json: serde_json::json!({"cmd": "cat /app/decomp.c"}),
+            }],
+        });
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Tool,
+            content: vec![NormalizedContentPart::ToolResult {
+                tool_call_id: ToolCallId::from("call-read"),
+            }],
+        });
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-read"),
+            scope,
+            result_json: serde_json::json!({"stdout": "decompressor source", "exit_code": 0}),
+            result_sha256: "tool-result".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+        let provider = ToolResultOrderProvider::default();
+        let calls = provider.calls.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(!output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(
+            output.tool_calls[0].tool_call_id,
+            ToolCallId::from("call-next")
+        );
+
+        let calls = calls.lock().unwrap();
+        assert!(calls[0].contains("orchestration plan"), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("continue root-visible tool execution"))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_model_plan_is_rejected_without_root_fallback() {
+        let request = text_request("complex request with an invalid planning response");
+        let runner = KernelRunner::new(InvalidPlannerProvider, KernelPolicy::default());
+
+        let error = runner.run(request).await.unwrap_err();
+
+        assert!(matches!(error, KernelError::ProviderRejected(message)
+            if message.contains("refusing root-only fallback")));
+    }
+
+    #[tokio::test]
+    async fn planner_repair_expands_under_target_model_plan_without_template_children() {
+        let request = text_request("compare implementation options across many independent risks");
+        let provider = PlannerRepairProvider::default();
+        let planner_inputs = provider.planner_inputs.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert!(
+            !output
+                .task_graph
+                .tasks
+                .keys()
+                .any(|task_id| task_id.as_ref().starts_with("deterministic-child-"))
+        );
+        assert!(
+            output
+                .task_graph
+                .tasks
+                .contains_key(&TaskId::from("model-expanded-15"))
+        );
+
+        let planner_inputs = planner_inputs.lock().unwrap();
+        assert_eq!(planner_inputs.len(), 2);
+        assert!(planner_inputs[1].contains("Previous orchestration attempt"));
+        assert!(planner_inputs[1].contains("target_child_agents=16"));
+    }
+
+    #[tokio::test]
+    async fn internal_orchestration_preserves_large_output_caps_and_sets_planner_contract() {
+        let mut request = text_request("spawn with tiny client cap");
+        request.reasoning_effort = ReasoningEffort::Low;
+        request.provider_options = serde_json::json!({
+            "max_tokens": 8,
+            "max_new_tokens": 65536,
+            "temperature": 0.2,
+            "stop": ["client-facing-stop"],
+            "stopping_strings": ["client-facing-stop"]
+        });
+        let provider = ProviderOptionFloorProvider::default();
+        let seen = provider.seen.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert_eq!(output.encrypted_subagent_state.len(), 4);
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|entry| {
+            entry.role == AgentRole::Leader
+                && entry.objective.contains("orchestration plan")
+                && entry.options["max_tokens"] == 2048
+                && entry.options["max_new_tokens"] == 65536
+                && entry.options["temperature"] == 0
+                && entry.options["response_format"]["type"] == "json_object"
+                && entry.options.get("stop").is_none()
+                && entry.options.get("stopping_strings").is_none()
+        }));
+        assert!(seen.iter().any(|entry| {
+            entry.role == AgentRole::Worker
+                && entry.options["max_tokens"] == 2048
+                && entry.options["max_new_tokens"] == 65536
+                && entry.options["temperature"] == 0.2
+                && entry.options.get("stop").is_none()
+                && entry.options.get("stopping_strings").is_none()
+        }));
+    }
+
     #[tokio::test]
     async fn runs_spawn_plan_through_bounded_kernel() {
         let scope = IsolationKey::new("tenant", "request-a", "conversation");
@@ -1613,7 +2466,7 @@ mod tests {
             output
                 .task_graph
                 .tasks
-                .contains_key(&TaskId::from("deterministic-child-01"))
+                .contains_key(&TaskId::from("child-00"))
         );
     }
 
@@ -1628,7 +2481,7 @@ mod tests {
         assert_eq!(output.final_text, "Final answer from main synthesizer.");
         assert_eq!(output.encrypted_subagent_state.len(), 16);
         for sealed in &output.encrypted_subagent_state {
-            assert!(sealed.task_id.as_ref().starts_with("deterministic-child-"));
+            assert!(sealed.task_id.as_ref().starts_with("child-tool-"));
             assert!(!sealed.ciphertext.contains("child-secret-output"));
             assert!(!sealed.ciphertext.contains("private_lookup"));
         }
@@ -1655,7 +2508,7 @@ mod tests {
     #[tokio::test]
     async fn medium_default_generates_sixteen_child_agents_with_four_in_flight() {
         let request = text_request("spawn six parallel probe children");
-        let provider = ParallelProbeProvider::new(6);
+        let provider = ParallelProbeProvider::new(16);
         let max_in_flight = provider.max_in_flight.clone();
         let runner = KernelRunner::new(provider, KernelPolicy::default());
 
@@ -1672,7 +2525,7 @@ mod tests {
         request.metadata = serde_json::json!({
             "agent": {"max_parallel_agents": 2}
         });
-        let provider = ParallelProbeProvider::new(6);
+        let provider = ParallelProbeProvider::new(16);
         let max_in_flight = provider.max_in_flight.clone();
         let runner = KernelRunner::new(provider, KernelPolicy::default());
 
@@ -1698,27 +2551,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_orchestrator_spawns_parallel_children_without_provider_spawn_plan() {
+    async fn model_orchestrator_rejects_missing_spawn_plan_without_template_fallback() {
         let request = text_request("ordinary request that still needs bounded orchestration");
         let provider = NoSpawnParallelProvider::default();
         let max_in_flight = provider.max_in_flight.clone();
         let runner = KernelRunner::new(provider, KernelPolicy::default());
 
-        let output = runner.run(request).await.unwrap();
+        let error = runner.run(request).await.unwrap_err();
 
-        assert!(output.verification.passed);
-        assert_eq!(output.encrypted_subagent_state.len(), 16);
-        assert_eq!(output.provider_call_count, 17);
-        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 4);
-        assert!(output.trace_events.iter().any(
-            |event| matches!(event, KernelTraceEvent::SpawnPlan { reason, children, .. }
-                    if reason.contains("deterministic") && children.len() == 16)
-        ));
-        assert_eq!(output.final_text, "deterministic synthesis complete");
+        assert!(matches!(error, KernelError::ProviderRejected(message)
+            if message.contains("refusing root-only fallback")));
+        assert_eq!(max_in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn deterministic_child_agents_receive_original_user_request() {
+    async fn model_planned_child_agents_receive_original_user_request() {
         let request = text_request("remember this exact phrase: alpha-beta");
         let provider = RecordingChildInputProvider::default();
         let child_inputs = provider.child_inputs.clone();
@@ -1731,9 +2578,176 @@ mod tests {
         assert_eq!(child_inputs.len(), 16);
         assert!(child_inputs.iter().all(|input| {
             input.contains("Child objective:")
-                && input.contains("Original user request:")
+                && input.contains("Original request and root-visible context:")
+                && input.contains("Worker artifact contract:")
+                && input.contains("do not request, invent, or simulate tool calls")
+                && input.contains("at most 6 short bullets")
                 && input.contains("remember this exact phrase: alpha-beta")
         }));
+    }
+
+    #[tokio::test]
+    async fn tool_context_answer_turn_uses_model_planned_children() {
+        let mut request = text_request("summarize the command output");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Assistant,
+            content: vec![NormalizedContentPart::ToolCall {
+                tool_call_id: ToolCallId::from("call-1"),
+                tool_name: "exec_command".to_string(),
+                arguments_json: serde_json::json!({"cmd": "printf needle"}),
+            }],
+        });
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Tool,
+            content: vec![NormalizedContentPart::ToolResult {
+                tool_call_id: ToolCallId::from("call-1"),
+            }],
+        });
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-1"),
+            scope,
+            result_json: serde_json::json!({"stdout": "needle found", "exit_code": 0}),
+            result_sha256: "result-hash".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+        let provider = RecordingChildInputProvider::default();
+        let child_inputs = provider.child_inputs.clone();
+        let seen_tools = provider.seen_tools.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert_eq!(output.provider_call_count, 18);
+        assert_eq!(output.final_text, "recorded root output");
+
+        let child_inputs = child_inputs.lock().unwrap();
+        assert_eq!(child_inputs.len(), 16);
+        assert!(child_inputs.iter().all(|input| {
+            input.contains("Root-visible tool context observed so far:")
+                && input.contains("Worker artifact contract:")
+                && input.contains("do not request, invent, or simulate tool calls")
+                && input.contains("exec_command")
+                && input.contains("printf needle")
+                && input.contains("needle found")
+        }));
+
+        let seen_tools = seen_tools.lock().unwrap();
+        assert!(seen_tools.iter().any(|entry| entry == "Leader:1"));
+        assert_eq!(
+            seen_tools
+                .iter()
+                .filter(|entry| entry.as_str() == "Worker:0")
+                .count(),
+            16
+        );
+        assert_eq!(
+            seen_tools
+                .iter()
+                .filter(|entry| entry.as_str() == "Leader:1")
+                .count(),
+            1
+        );
+        assert!(!seen_tools.iter().any(|entry| entry == "Synthesizer:0"));
+        assert!(!seen_tools.iter().any(|entry| entry == "Worker:1"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_turn_can_continue_root_tool_loop() {
+        let mut request = text_request("continue after observing the command output");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Assistant,
+            content: vec![NormalizedContentPart::ToolCall {
+                tool_call_id: ToolCallId::from("call-1"),
+                tool_name: "exec_command".to_string(),
+                arguments_json: serde_json::json!({"cmd": "python3 --version"}),
+            }],
+        });
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Tool,
+            content: vec![NormalizedContentPart::ToolResult {
+                tool_call_id: ToolCallId::from("call-1"),
+            }],
+        });
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-1"),
+            scope,
+            result_json: serde_json::json!({"stderr": "python3: command not found", "exit_code": 127}),
+            result_sha256: "result-hash".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+        let runner = KernelRunner::new(ToolContinuationProvider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(!output.verification.passed);
+        assert_eq!(output.provider_call_count, 18);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert!(output.final_text.is_empty());
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].tool_name, "exec_command");
+        assert_eq!(output.tool_calls[0].arguments_json["cmd"], "ls -la /app");
+    }
+
+    #[tokio::test]
+    async fn worker_findings_return_to_root_for_next_tool_call() {
+        let mut request = text_request("fix the failed command and continue");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Assistant,
+            content: vec![NormalizedContentPart::ToolCall {
+                tool_call_id: ToolCallId::from("call-bad"),
+                tool_name: "exec_command".to_string(),
+                arguments_json: serde_json::json!({"cmd": "opensslget -subject"}),
+            }],
+        });
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Tool,
+            content: vec![NormalizedContentPart::ToolResult {
+                tool_call_id: ToolCallId::from("call-bad"),
+            }],
+        });
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-bad"),
+            scope,
+            result_json: serde_json::json!({"stderr": "opensslget: command not found", "exit_code": 127}),
+            result_sha256: "result-hash".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+        let runner = KernelRunner::new(
+            WorkerFindingToolContinuationProvider,
+            KernelPolicy::default(),
+        );
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(!output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert_eq!(output.provider_call_count, 18);
+        assert!(output.final_text.is_empty());
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(
+            output.tool_calls[0].arguments_json["cmd"],
+            "openssl x509 -subject -noout -in /app/ssl/server.crt"
+        );
     }
 
     #[tokio::test]
@@ -1797,7 +2811,14 @@ mod tests {
 
         assert!(output.verification.passed);
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen, vec!["Leader:1", "Worker:0", "Synthesizer:0"]);
+        assert_eq!(seen.first().map(String::as_str), Some("Leader:1"));
+        assert_eq!(
+            seen.iter()
+                .filter(|entry| entry.as_str() == "Worker:0")
+                .count(),
+            16
+        );
+        assert_eq!(seen.last().map(String::as_str), Some("Synthesizer:0"));
     }
 
     #[tokio::test]
@@ -1807,10 +2828,10 @@ mod tests {
 
         let output = runner.run(request).await.unwrap();
 
-        assert_eq!(output.provider_call_count, 17);
-        assert_eq!(output.usage.input_tokens, 91);
-        assert_eq!(output.usage.output_tokens, 125);
-        assert_eq!(output.verification.budget_summary.token_used, 216);
+        assert_eq!(output.provider_call_count, 18);
+        assert_eq!(output.usage.input_tokens, 94);
+        assert_eq!(output.usage.output_tokens, 127);
+        assert_eq!(output.verification.budget_summary.token_used, 221);
     }
 
     #[tokio::test]
@@ -1832,8 +2853,8 @@ mod tests {
                 task_id,
                 text_outputs,
                 ..
-            } if task_id.as_ref() == "deterministic-child-01"
-                && text_outputs.iter().any(|text| text.contains("Deterministic child"))
+            } if task_id.as_ref() == "usage-child-00"
+                && text_outputs.iter().any(|text| text.contains("work"))
         )));
         assert!(output.trace_events.iter().any(|event| matches!(
             event,
@@ -1905,7 +2926,7 @@ mod tests {
     #[tokio::test]
     async fn provider_tool_calls_cannot_exceed_total_budget() {
         let mut request = text_request("too many tools");
-        request.reasoning_effort = ReasoningEffort::Low;
+        request.reasoning_effort = ReasoningEffort::None;
         let runner = KernelRunner::new(ManyToolCallsProvider, KernelPolicy::default());
 
         let error = runner.run(request).await.unwrap_err();
@@ -1917,17 +2938,12 @@ mod tests {
     async fn reasoning_effort_high_allows_more_than_four_agents() {
         let mut request = text_request("spawn five children");
         request.reasoning_effort = ReasoningEffort::High;
-        request.tools = vec![ToolDefinition {
-            name: "lookup".to_string(),
-            description: Some("public client tool".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-        }];
-        let runner = KernelRunner::new(FiveChildProvider, KernelPolicy::default());
+        let runner = KernelRunner::new(ParallelProbeProvider::new(32), KernelPolicy::default());
 
         let output = runner.run(request).await.unwrap();
 
         assert!(output.verification.passed);
-        assert_eq!(output.encrypted_subagent_state.len(), 5);
+        assert_eq!(output.encrypted_subagent_state.len(), 32);
     }
 
     #[tokio::test]
@@ -1948,7 +2964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn higher_reasoning_effort_improves_deterministic_eval_coverage() {
+    async fn higher_reasoning_effort_improves_model_planned_eval_coverage() {
         let low = run_effort_coverage_eval(ReasoningEffort::Low).await;
         let high = run_effort_coverage_eval(ReasoningEffort::High).await;
         let xhigh = run_effort_coverage_eval(ReasoningEffort::XHigh).await;
@@ -1980,7 +2996,7 @@ mod tests {
 
         let output = runner.run(request).await.unwrap();
 
-        assert_eq!(output.provider_call_count, 17);
+        assert_eq!(output.provider_call_count, 18);
         assert!(
             output
                 .final_text
@@ -2074,37 +3090,42 @@ mod tests {
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
             match request.task.role {
-                AgentRole::Leader => Ok(ProviderResponse {
-                    artifacts: vec![AgentArtifact::SpawnPlan {
-                        id: ArtifactId::from("spawn-plan-child-tool"),
-                        scope: request.scope.clone(),
-                        plan: SpawnPlan {
-                            parent_task_id: request.task.task_id,
-                            reason: "delegate private lookup".to_string(),
-                            children: vec![SubtaskSpec {
-                                task_id: TaskId::from("child-tool"),
-                                parent_task_id: Some(TaskId::from("root")),
-                                spawn_depth: 1,
-                                role: AgentRole::Worker,
-                                objective: "private child tool work".to_string(),
-                                input_artifact_refs: vec![],
-                                expected_outputs: vec![ArtifactKind::Text],
-                                allowed_capabilities: CapabilitySet::from([
-                                    Capability::Text,
-                                    Capability::ToolCall,
-                                ]),
-                                limits: AgentLimits::default(),
-                            }],
-                            expected_artifacts: vec![ArtifactKind::Text],
-                            budget_request: BudgetRequest {
-                                max_tokens: 128,
-                                max_tool_calls: 1,
+                AgentRole::Leader => {
+                    let target = target_child_agents(&request);
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("spawn-plan-child-tool"),
+                            scope: request.scope.clone(),
+                            plan: SpawnPlan {
+                                parent_task_id: request.task.task_id,
+                                reason: "delegate private lookup".to_string(),
+                                children: (0..target)
+                                    .map(|index| SubtaskSpec {
+                                        task_id: TaskId::from(format!("child-tool-{index:02}")),
+                                        parent_task_id: Some(TaskId::from("root")),
+                                        spawn_depth: 1,
+                                        role: AgentRole::Worker,
+                                        objective: format!("private child tool work {index}"),
+                                        input_artifact_refs: vec![],
+                                        expected_outputs: vec![ArtifactKind::Text],
+                                        allowed_capabilities: CapabilitySet::from([
+                                            Capability::Text,
+                                            Capability::ToolCall,
+                                        ]),
+                                        limits: AgentLimits::default(),
+                                    })
+                                    .collect(),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 128,
+                                    max_tool_calls: 1,
+                                },
                             },
-                        },
-                    }],
-                    tool_calls: vec![],
-                    usage: Default::default(),
-                }),
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
                 AgentRole::Worker => Ok(ProviderResponse {
                     artifacts: vec![AgentArtifact::Text {
                         id: ArtifactId::from("child-secret-text"),
@@ -2177,6 +3198,464 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ModelPlanProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ModelPlanProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    let target = target_child_agents(&request);
+                    let mut children = vec![
+                        model_child(
+                            "inspect-format",
+                            "inspect the decompressor protocol and derive constraints",
+                        ),
+                        model_child(
+                            "build-candidate",
+                            "construct the candidate compressed artifact",
+                        ),
+                        model_child(
+                            "verify-result",
+                            "verify the generated artifact against the decompressor",
+                        ),
+                    ];
+                    children.extend(model_children(
+                        "implementation-risk",
+                        target.saturating_sub(children.len()),
+                        "model-selected supporting implementation risk slice",
+                    ));
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("spawn-plan-model-selected"),
+                            scope: request.scope.clone(),
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: "model selected distinct implementation phases".to_string(),
+                                children,
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 768,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: ProviderUsage {
+                            input_tokens: 7,
+                            output_tokens: 11,
+                        },
+                    })
+                }
+                AgentRole::Worker => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: format!(
+                            "worker {} completed {}",
+                            request.task.task_id.as_ref(),
+                            request.task.objective
+                        ),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                }),
+                AgentRole::Synthesizer => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from("model-plan-final"),
+                        scope: request.scope,
+                        text: "model planned synthesis complete".to_string(),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                }),
+                AgentRole::Leader | AgentRole::ReasoningSummarizer | AgentRole::Verifier => {
+                    Ok(ProviderResponse::default())
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ToolResultModelPlanProvider {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ToolResultModelPlanProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    if request.input_text.contains("decompressor source") {
+                        self.seen
+                            .lock()
+                            .unwrap()
+                            .push("planner saw tool result".to_string());
+                    }
+                    let target = target_child_agents(&request);
+                    let mut children = vec![
+                        model_child("derive-encoder", "derive an encoder from decomp.c"),
+                        model_child(
+                            "verify-by-command",
+                            "verify cat data.comp | /app/decomp against data.txt",
+                        ),
+                    ];
+                    children.extend(model_children(
+                        "tool-evidence-slice",
+                        target.saturating_sub(children.len()),
+                        "analyze observed tool evidence slice",
+                    ));
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("spawn-plan-tool-result"),
+                            scope: request.scope.clone(),
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: "model used tool output to choose concrete workers"
+                                    .to_string(),
+                                children,
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 512,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
+                AgentRole::Worker => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: format!("worker result: {}", request.task.objective),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                }),
+                AgentRole::Synthesizer => {
+                    if !request.input_text.contains("leader pre-answer") {
+                        self.seen
+                            .lock()
+                            .unwrap()
+                            .push("synthesizer had no leader pre-answer".to_string());
+                    }
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::Text {
+                            id: ArtifactId::from("tool-result-final"),
+                            scope: request.scope,
+                            text: "final artifact instructions".to_string(),
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
+                AgentRole::Leader | AgentRole::ReasoningSummarizer | AgentRole::Verifier => {
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::Text {
+                            id: ArtifactId::from("leader-pre-answer"),
+                            scope: request.scope,
+                            text: "leader pre-answer".to_string(),
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ToolResultOrderProvider {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ToolResultOrderProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.calls.lock().unwrap().push(format!(
+                "{:?}:{}",
+                request.task.role, request.task.objective
+            ));
+
+            if request.task.role == AgentRole::Leader
+                && request
+                    .task
+                    .objective
+                    .contains("continue root-visible tool execution")
+            {
+                return Ok(ProviderResponse {
+                    artifacts: vec![],
+                    tool_calls: vec![ToolCallRecord {
+                        tool_call_id: ToolCallId::from("call-next"),
+                        scope: request.scope.clone(),
+                        task_id: request.task.task_id,
+                        agent_id: AgentId::from("agent-root"),
+                        tool_name: "exec_command".to_string(),
+                        arguments_sha256: "hash".to_string(),
+                        arguments_json: serde_json::json!({"cmd": "python3 build_encoder.py"}),
+                        status: ToolCallStatus::Pending,
+                        created_at_ms: 0,
+                        resolved_at_ms: None,
+                    }],
+                    usage: Default::default(),
+                });
+            }
+
+            if request.task.role == AgentRole::Leader
+                && request.task.objective.contains("orchestration plan")
+            {
+                let target = target_child_agents(&request);
+                let mut children = vec![
+                    model_child("decode-format", "derive encoding constraints from decomp.c"),
+                    model_child(
+                        "plan-command",
+                        "identify the next command to build data.comp",
+                    ),
+                ];
+                children.extend(model_children(
+                    "next-tool-analysis",
+                    target.saturating_sub(children.len()),
+                    "analyze one independent aspect before next root-visible command",
+                ));
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-tool-result-order"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason:
+                                "analyze tool result before selecting next root-visible command"
+                                    .to_string(),
+                            children,
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 512,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
+
+            let text = match request.task.role {
+                AgentRole::Worker => format!("worker finding: {}", request.task.objective),
+                AgentRole::Synthesizer => "unexpected synthesis".to_string(),
+                AgentRole::ReasoningSummarizer => "summary".to_string(),
+                AgentRole::Leader | AgentRole::Verifier => {
+                    "unexpected root direct answer".to_string()
+                }
+            };
+
+            Ok(ProviderResponse {
+                artifacts: vec![AgentArtifact::Text {
+                    id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                    scope: request.scope,
+                    text,
+                }],
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct InvalidPlannerProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for InvalidPlannerProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::Text {
+                            id: ArtifactId::from("invalid-plan"),
+                            scope: request.scope,
+                            text: "I should probably split this, but I am not returning JSON."
+                                .to_string(),
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
+                AgentRole::Leader => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from("root-final"),
+                        scope: request.scope,
+                        text: "root final after invalid plan".to_string(),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                }),
+                AgentRole::Worker
+                | AgentRole::ReasoningSummarizer
+                | AgentRole::Synthesizer
+                | AgentRole::Verifier => Ok(ProviderResponse::default()),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PlannerRepairProvider {
+        planner_inputs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PlannerRepairProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    self.planner_inputs
+                        .lock()
+                        .unwrap()
+                        .push(request.input_text.clone());
+                    let repair = request
+                        .input_text
+                        .contains("Previous orchestration attempt");
+                    let child_count = if repair { 16 } else { 2 };
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from(if repair {
+                                "spawn-plan-repaired"
+                            } else {
+                                "spawn-plan-under-target"
+                            }),
+                            scope: request.scope.clone(),
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: if repair {
+                                    "model repaired coverage to match the configured tier"
+                                } else {
+                                    "model initially under-covered the task"
+                                }
+                                .to_string(),
+                                children: (0..child_count)
+                                    .map(|index| {
+                                        model_child(
+                                            &format!("model-expanded-{index:02}"),
+                                            &format!("model-selected risk slice {index}"),
+                                        )
+                                    })
+                                    .collect(),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 4096,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
+                AgentRole::Worker => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: format!("worker completed {}", request.task.objective),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                }),
+                AgentRole::Synthesizer => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from("repair-final"),
+                        scope: request.scope,
+                        text: "repair synthesis complete".to_string(),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                }),
+                AgentRole::Leader | AgentRole::ReasoningSummarizer | AgentRole::Verifier => {
+                    Ok(ProviderResponse::default())
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SeenProviderOptions {
+        role: AgentRole,
+        objective: String,
+        options: serde_json::Value,
+    }
+
+    #[derive(Clone, Default)]
+    struct ProviderOptionFloorProvider {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<SeenProviderOptions>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ProviderOptionFloorProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.seen.lock().unwrap().push(SeenProviderOptions {
+                role: request.task.role.clone(),
+                objective: request.task.objective.clone(),
+                options: request.provider_options.clone(),
+            });
+
+            if request.task.role == AgentRole::Leader
+                && request.task.objective.contains("orchestration plan")
+            {
+                let target = target_child_agents(&request);
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-option-floor"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason: "verify internal output cap floor".to_string(),
+                            children: model_children(
+                                "option-floor-child",
+                                target,
+                                "inspect option floor",
+                            ),
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 512,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
+
+            Ok(ProviderResponse {
+                artifacts: vec![AgentArtifact::Text {
+                    id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                    scope: request.scope,
+                    text: "option floor response".to_string(),
+                }],
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+    }
+
     #[derive(Clone, Default)]
     struct SummaryPipelineProvider {
         calls: std::sync::Arc<std::sync::Mutex<Vec<SummaryPipelineCall>>>,
@@ -2200,11 +3679,30 @@ mod tests {
             });
 
             let text = match request.task.task_id.as_ref() {
-                "reasoning-summary" => {
-                    "deterministic-child-01 (Worker agent): summarized child 1\n\
-                     deterministic-child-02 (Worker agent): summarized child 2"
-                        .to_string()
+                "root" if request.task.objective.contains("orchestration plan") => {
+                    let target = target_child_agents(&request);
+                    return Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("spawn-plan-summary-pipeline"),
+                            scope: request.scope.clone(),
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: "model selected comparison workers".to_string(),
+                                children: model_children("summary-child", target, "compare option"),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 512,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    });
                 }
+                "reasoning-summary" => "summary-child-a (Worker agent): summarized child 1\n\
+                     summary-child-b (Worker agent): summarized child 2"
+                    .to_string(),
                 "synthesizer" => {
                     assert!(
                         request.input_text.contains("RAW-WORKER-DETAIL"),
@@ -2218,7 +3716,7 @@ mod tests {
                     );
                     "final answer from original worker findings".to_string()
                 }
-                task_id if task_id.starts_with("deterministic-child-") => {
+                task_id if request.task.role == AgentRole::Worker => {
                     format!("RAW-WORKER-DETAIL from {task_id}: {}", "x".repeat(512))
                 }
                 _ => String::new(),
@@ -2312,6 +3810,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingChildInputProvider {
         child_inputs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        seen_tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -2320,11 +3819,44 @@ mod tests {
             &self,
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
+            self.seen_tools.lock().unwrap().push(format!(
+                "{:?}:{}",
+                request.task.role,
+                request.tools.len()
+            ));
             if matches!(request.task.role, AgentRole::Worker) {
                 self.child_inputs
                     .lock()
                     .unwrap()
                     .push(request.input_text.clone());
+            }
+
+            if request.task.role == AgentRole::Leader
+                && request.task.objective.contains("orchestration plan")
+            {
+                let target = target_child_agents(&request);
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-recording"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason: "record model-selected child inputs".to_string(),
+                            children: model_children(
+                                "record-child",
+                                target,
+                                "record independent view",
+                            ),
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 512,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
             }
 
             let text = match request.task.role {
@@ -2334,6 +3866,176 @@ mod tests {
                 AgentRole::Leader | AgentRole::Verifier => "recorded root output".to_string(),
             };
 
+            Ok(ProviderResponse {
+                artifacts: vec![AgentArtifact::Text {
+                    id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                    scope: request.scope,
+                    text,
+                }],
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ToolContinuationProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ToolContinuationProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            assert!(
+                request
+                    .system_instructions
+                    .iter()
+                    .any(|instruction| instruction.contains("Tool execution policy")),
+                "tool-capable requests must carry root tool-loop guidance"
+            );
+            if request.task.objective.contains("orchestration plan") {
+                assert_eq!(request.task.role, AgentRole::Leader);
+                let target = target_child_agents(&request);
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-tool-continuation"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason:
+                                "mock provider analyzes tool turn before returning to root leader"
+                                    .to_string(),
+                            children: model_children(
+                                "tool-continuation-child",
+                                target,
+                                "analyze command failure before root continuation",
+                            ),
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 0,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
+            if request.task.role == AgentRole::Worker {
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: format!("worker finding: {}", request.task.objective),
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
+            assert_eq!(request.task.role, AgentRole::Leader);
+            assert_eq!(request.tools.len(), 1);
+            assert_eq!(request.tool_results.len(), 1);
+            Ok(ProviderResponse {
+                artifacts: vec![],
+                tool_calls: vec![ToolCallRecord {
+                    tool_call_id: ToolCallId::from("call-2"),
+                    scope: request.scope.clone(),
+                    task_id: request.task.task_id,
+                    agent_id: AgentId::from("agent-root"),
+                    tool_name: "exec_command".to_string(),
+                    arguments_sha256: "hash".to_string(),
+                    arguments_json: serde_json::json!({"cmd": "ls -la /app"}),
+                    status: ToolCallStatus::Pending,
+                    created_at_ms: 0,
+                    resolved_at_ms: None,
+                }],
+                usage: Default::default(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct WorkerFindingToolContinuationProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for WorkerFindingToolContinuationProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            if request
+                .task
+                .objective
+                .contains("continue root-visible tool execution")
+            {
+                assert!(
+                    request
+                        .input_text
+                        .contains("Worker-agent findings available to the root leader")
+                );
+                assert!(request.input_text.contains("openssl x509"));
+                return Ok(ProviderResponse {
+                    artifacts: vec![],
+                    tool_calls: vec![ToolCallRecord {
+                        tool_call_id: ToolCallId::from("call-fixed"),
+                        scope: request.scope.clone(),
+                        task_id: request.task.task_id,
+                        agent_id: AgentId::from("agent-root"),
+                        tool_name: "exec_command".to_string(),
+                        arguments_sha256: "hash".to_string(),
+                        arguments_json: serde_json::json!({
+                            "cmd": "openssl x509 -subject -noout -in /app/ssl/server.crt"
+                        }),
+                        status: ToolCallStatus::Pending,
+                        created_at_ms: 0,
+                        resolved_at_ms: None,
+                    }],
+                    usage: Default::default(),
+                });
+            }
+
+            if request.task.role == AgentRole::Leader
+                && request.task.objective.contains("orchestration plan")
+            {
+                let target = target_child_agents(&request);
+                let mut children = vec![
+                    model_child("fix-command", "replace opensslget with openssl x509"),
+                    model_child("verify-command", "check corrected command arguments"),
+                ];
+                children.extend(model_children(
+                    "command-repair-slice",
+                    target.saturating_sub(children.len()),
+                    "analyze command repair evidence",
+                ));
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-worker-finding-tool"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason: "workers should identify the corrected command".to_string(),
+                            children,
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 512,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
+
+            let text = match request.task.role {
+                AgentRole::Leader => "root observed failed command".to_string(),
+                AgentRole::Worker => {
+                    "Use: openssl x509 -subject -noout -in /app/ssl/server.crt".to_string()
+                }
+                AgentRole::Synthesizer => "unexpected synthesizer".to_string(),
+                AgentRole::ReasoningSummarizer | AgentRole::Verifier => String::new(),
+            };
             Ok(ProviderResponse {
                 artifacts: vec![AgentArtifact::Text {
                     id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
@@ -2379,6 +4081,34 @@ mod tests {
             &self,
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
+            if request.task.role == AgentRole::Leader
+                && request.task.objective.contains("orchestration plan")
+            {
+                let target = target_child_agents(&request);
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-structured"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason: "format-sensitive synthesis needs one worker finding"
+                                .to_string(),
+                            children: model_children(
+                                "structured-child",
+                                target,
+                                "produce the structured finding to preserve",
+                            ),
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 256,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
             let text = match request.task.role {
                 AgentRole::ReasoningSummarizer => "structured finding",
                 AgentRole::Synthesizer => {
@@ -2417,34 +4147,31 @@ mod tests {
                 request.tools.len()
             ));
             match request.task.role {
-                AgentRole::Leader => Ok(ProviderResponse {
-                    artifacts: vec![AgentArtifact::SpawnPlan {
-                        id: ArtifactId::from("spawn-plan-tool-visibility"),
-                        scope: request.scope.clone(),
-                        plan: SpawnPlan {
-                            parent_task_id: request.task.task_id,
-                            reason: "verify tool visibility".to_string(),
-                            children: vec![SubtaskSpec {
-                                task_id: TaskId::from("tool-visibility-child"),
-                                parent_task_id: Some(TaskId::from("root")),
-                                spawn_depth: 1,
-                                role: AgentRole::Worker,
-                                objective: "child should not see client tools".to_string(),
-                                input_artifact_refs: vec![],
-                                expected_outputs: vec![ArtifactKind::Text],
-                                allowed_capabilities: CapabilitySet::from([Capability::Text]),
-                                limits: AgentLimits::default(),
-                            }],
-                            expected_artifacts: vec![ArtifactKind::Text],
-                            budget_request: BudgetRequest {
-                                max_tokens: 128,
-                                max_tool_calls: 0,
+                AgentRole::Leader => {
+                    let target = target_child_agents(&request);
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("spawn-plan-tool-visibility"),
+                            scope: request.scope.clone(),
+                            plan: SpawnPlan {
+                                parent_task_id: request.task.task_id,
+                                reason: "verify tool visibility".to_string(),
+                                children: model_children(
+                                    "tool-visibility-child",
+                                    target,
+                                    "child should not see client tools",
+                                ),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 128,
+                                    max_tool_calls: 0,
+                                },
                             },
-                        },
-                    }],
-                    tool_calls: vec![],
-                    usage: Default::default(),
-                }),
+                        }],
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                    })
+                }
                 AgentRole::Worker
                 | AgentRole::ReasoningSummarizer
                 | AgentRole::Synthesizer
@@ -2687,6 +4414,33 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(request.system_instructions.clone());
+            if request.task.role == AgentRole::Leader
+                && request.task.objective.contains("orchestration plan")
+            {
+                let target = target_child_agents(&request);
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::SpawnPlan {
+                        id: ArtifactId::from("spawn-plan-probe"),
+                        scope: request.scope.clone(),
+                        plan: SpawnPlan {
+                            parent_task_id: TaskId::from("root"),
+                            reason: "probe only needs to inspect policy instructions".to_string(),
+                            children: model_children(
+                                "probe-child",
+                                target,
+                                "observe policy instruction slice",
+                            ),
+                            expected_artifacts: vec![ArtifactKind::Text],
+                            budget_request: BudgetRequest {
+                                max_tokens: 0,
+                                max_tool_calls: 0,
+                            },
+                        },
+                    }],
+                    tool_calls: vec![],
+                    usage: Default::default(),
+                });
+            }
             Ok(ProviderResponse {
                 artifacts: vec![AgentArtifact::Text {
                     id: ArtifactId::from("probe-text"),
@@ -2710,7 +4464,7 @@ mod tests {
         ) -> Result<ProviderResponse, ProviderError> {
             match request.task.role {
                 AgentRole::Leader => {
-                    let target = target_parallel_agents(&request.system_instructions).min(8);
+                    let target = target_parallel_agents(&request.system_instructions);
                     Ok(ProviderResponse {
                         artifacts: vec![AgentArtifact::SpawnPlan {
                             id: ArtifactId::from("spawn-plan-effort-coverage"),
@@ -2789,47 +4543,46 @@ mod tests {
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
             match request.task.role {
-                AgentRole::Leader => Ok(ProviderResponse {
-                    artifacts: vec![
-                        AgentArtifact::Text {
-                            id: ArtifactId::from("input"),
-                            scope: request.scope.clone(),
-                            text: "seed".to_string(),
-                        },
-                        AgentArtifact::SpawnPlan {
-                            id: ArtifactId::from("spawn-plan-usage"),
-                            scope: request.scope.clone(),
-                            plan: SpawnPlan {
-                                parent_task_id: request.task.task_id,
-                                reason: "measure child usage".to_string(),
-                                children: vec![
-                                    child(
-                                        "usage-child-a",
-                                        &TaskId::from("root"),
-                                        1,
-                                        &request.scope,
-                                    ),
-                                    child(
-                                        "usage-child-b",
-                                        &TaskId::from("root"),
-                                        1,
-                                        &request.scope,
-                                    ),
-                                ],
-                                expected_artifacts: vec![ArtifactKind::Text],
-                                budget_request: BudgetRequest {
-                                    max_tokens: 256,
-                                    max_tool_calls: 0,
+                AgentRole::Leader => {
+                    let target = target_child_agents(&request);
+                    Ok(ProviderResponse {
+                        artifacts: vec![
+                            AgentArtifact::Text {
+                                id: ArtifactId::from("input"),
+                                scope: request.scope.clone(),
+                                text: "seed".to_string(),
+                            },
+                            AgentArtifact::SpawnPlan {
+                                id: ArtifactId::from("spawn-plan-usage"),
+                                scope: request.scope.clone(),
+                                plan: SpawnPlan {
+                                    parent_task_id: request.task.task_id,
+                                    reason: "measure child usage".to_string(),
+                                    children: (0..target)
+                                        .map(|index| {
+                                            child(
+                                                &format!("usage-child-{index:02}"),
+                                                &TaskId::from("root"),
+                                                1,
+                                                &request.scope,
+                                            )
+                                        })
+                                        .collect(),
+                                    expected_artifacts: vec![ArtifactKind::Text],
+                                    budget_request: BudgetRequest {
+                                        max_tokens: 256,
+                                        max_tool_calls: 0,
+                                    },
                                 },
                             },
+                        ],
+                        tool_calls: vec![],
+                        usage: ProviderUsage {
+                            input_tokens: 3,
+                            output_tokens: 2,
                         },
-                    ],
-                    tool_calls: vec![],
-                    usage: ProviderUsage {
-                        input_tokens: 3,
-                        output_tokens: 2,
-                    },
-                }),
+                    })
+                }
                 AgentRole::Worker => Ok(ProviderResponse {
                     artifacts: vec![AgentArtifact::Text {
                         id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
@@ -2878,6 +4631,18 @@ mod tests {
             .unwrap_or(1)
     }
 
+    fn target_child_agents(request: &ProviderRequest) -> usize {
+        request
+            .task
+            .objective
+            .split("exactly ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| target_parallel_agents(&request.system_instructions))
+            .max(1)
+    }
+
     #[derive(Clone)]
     struct ManyToolCallsProvider;
 
@@ -2923,5 +4688,30 @@ mod tests {
             allowed_capabilities: CapabilitySet::from([Capability::Text]),
             limits: AgentLimits::default(),
         }
+    }
+
+    fn model_child(id: &str, objective: &str) -> SubtaskSpec {
+        SubtaskSpec {
+            task_id: TaskId::from(id),
+            parent_task_id: Some(TaskId::from("root")),
+            spawn_depth: 1,
+            role: AgentRole::Worker,
+            objective: objective.to_string(),
+            input_artifact_refs: vec![],
+            expected_outputs: vec![ArtifactKind::Text],
+            allowed_capabilities: CapabilitySet::from([Capability::Text]),
+            limits: AgentLimits::default(),
+        }
+    }
+
+    fn model_children(prefix: &str, count: usize, objective_prefix: &str) -> Vec<SubtaskSpec> {
+        (0..count)
+            .map(|index| {
+                model_child(
+                    &format!("{prefix}-{index:02}"),
+                    &format!("{objective_prefix} {index}"),
+                )
+            })
+            .collect()
     }
 }
