@@ -150,15 +150,15 @@ pub struct OpenAiResponsesRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OpenAiMessage {
     pub role: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<OpenAiContent>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<OpenAiMessageToolCall>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_call: Option<OpenAiLegacyFunctionCall>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
@@ -10495,6 +10495,32 @@ mod tests {
             "adapter text output"
         );
         assert_eq!(response["output_text"], "adapter text output");
+    }
+
+    #[tokio::test]
+    async fn responses_chat_request_omits_null_message_fields_for_strict_backends() {
+        let request = parse_openai_responses_request(serde_json::json!({
+            "model": "mock",
+            "input": "adapter text",
+            "reasoning": {"effort": "none"}
+        }))
+        .unwrap();
+        let execution = prepare_openai_responses_execution(
+            &ResponsesStore::new(None),
+            request,
+            &RequestContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let raw = openai_chat_request_json(&execution.chat_request, false);
+        let message = &raw["messages"][0];
+
+        assert_eq!(message["role"], "user");
+        assert!(message.get("name").is_none());
+        assert!(message.get("function_call").is_none());
+        assert!(message.get("tool_call_id").is_none());
+        assert!(message.get("tool_calls").is_none());
     }
 
     #[tokio::test]

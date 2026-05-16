@@ -429,7 +429,9 @@ where
         } else {
             let mut root_preface_artifacts = Vec::new();
 
-            if should_run_root_tool_gate(&request) {
+            if should_run_root_tool_gate(&request)
+                && !should_use_model_orchestration(&request, &request_policy)
+            {
                 trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
                 let root_response = self
                     .provider
@@ -704,11 +706,7 @@ where
             .collect();
 
         let mut root_continuation_artifacts = Vec::new();
-        if root_unresolved.is_empty()
-            && has_child_tasks
-            && !request.tools.is_empty()
-            && !request.tool_results.is_empty()
-        {
+        if root_unresolved.is_empty() && has_child_tasks && root_tools_available(&request) {
             let root_continuation_task = SubtaskSpec {
                 objective: "continue root-visible tool execution from worker findings, or produce a final answer only when complete".to_string(),
                 ..root_task.clone()
@@ -1265,13 +1263,156 @@ fn system_instructions_with_policy(
     if !request.tools.is_empty() {
         instructions.push(
             "Tool execution policy: child agents cannot call client tools. When the task needs \
-             commands, file edits, retrieval, or more observation after a tool result, the root \
-             leader must emit the next root-visible tool call instead of finalizing with a plan. \
-             Continue the tool loop until the requested work is actually complete."
+             commands, file edits, retrieval, or more observation, the root leader must emit the \
+             next root-visible tool call instead of finalizing with a plan. \
+             Continue the tool loop until the requested work is actually complete. Once accepted \
+             tool results show the requested artifacts were created and at least one relevant \
+             validation succeeded, stop calling tools and return the final answer. Do not repeat \
+             successful commands or equivalent validation just to gather more confidence. For \
+             environment-building tasks, planning/status-only tools are not a substitute for \
+             concrete execution or observation tools. Prefer a cohesive command/script that safely \
+             performs related setup and verification steps together over many one-step tool calls."
                 .to_string(),
         );
+        if let Some(tool_policy) = stateful_tool_policy_instruction(request) {
+            instructions.push(tool_policy);
+        }
     }
     instructions
+}
+
+fn stateful_tool_policy_instruction(request: &NormalizedRequest) -> Option<String> {
+    let stateful_tools = request
+        .tools
+        .iter()
+        .filter_map(stateful_tool_contract)
+        .collect::<Vec<_>>();
+    if stateful_tools.is_empty() {
+        return None;
+    }
+
+    let handles = observed_stateful_handles(request);
+    let handle_text = if handles.is_empty() {
+        "No state handle IDs have been observed in accepted tool results for this conversation."
+            .to_string()
+    } else {
+        format!(
+            "Observed state handle IDs from accepted tool results: {}.",
+            handles.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    };
+
+    Some(format!(
+        "Stateful tool policy: tools with session/process handle parameters may only be called \
+         with handle IDs explicitly returned by accepted tool results in this same conversation. \
+         Do not invent numeric IDs, reuse IDs from unrelated turns, or call a state-continuation \
+         tool when the referenced operation already completed without returning a live handle. \
+         If no active handle is visible, use an appropriate stateless/starter tool instead.\n\
+         {handle_text}\n{}",
+        stateful_tools.join("\n")
+    ))
+}
+
+fn stateful_tool_contract(tool: &ToolDefinition) -> Option<String> {
+    let properties = tool
+        .input_schema
+        .get("properties")
+        .and_then(|value| value.as_object())?;
+    let state_fields = properties
+        .keys()
+        .filter(|name| is_state_handle_field(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if state_fields.is_empty() {
+        return None;
+    }
+
+    let required = tool
+        .input_schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let required_state_fields = state_fields
+        .iter()
+        .filter(|name| required.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let required_text = if required_state_fields.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Required handle field(s): {}.",
+            required_state_fields.join(", ")
+        )
+    };
+
+    Some(format!(
+        "- Tool `{}` has state handle field(s): {}.{}",
+        tool.name,
+        state_fields.join(", "),
+        required_text
+    ))
+}
+
+fn observed_stateful_handles(request: &NormalizedRequest) -> BTreeSet<String> {
+    let mut handles = BTreeSet::new();
+    for result in request
+        .tool_results
+        .iter()
+        .filter(|result| result.status == ToolResultStatus::Accepted)
+    {
+        collect_stateful_handles(&result.result_json, &mut handles);
+    }
+    handles
+}
+
+fn collect_stateful_handles(value: &serde_json::Value, handles: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if is_state_handle_field(key) {
+                    if let Some(handle) = state_handle_value(value) {
+                        handles.insert(format!("{key}={handle}"));
+                    }
+                }
+                collect_stateful_handles(value, handles);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_stateful_handles(value, handles);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn state_handle_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn is_state_handle_field(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "sessionid" | "processid" | "procid" | "pid" | "targetsessionid" | "targetprocessid"
+    )
 }
 
 fn orchestration_policy_instruction(effort: &ReasoningEffort, policy: &KernelPolicy) -> String {
@@ -1297,7 +1438,11 @@ fn reasoning_effort_name(effort: &ReasoningEffort) -> &'static str {
 }
 
 fn should_run_root_tool_gate(request: &NormalizedRequest) -> bool {
-    !request.tools.is_empty() && request.tool_results.is_empty()
+    root_tools_available(request) && request.tool_results.is_empty()
+}
+
+fn root_tools_available(request: &NormalizedRequest) -> bool {
+    !request.tools.is_empty() && !matches!(request.tool_choice, ToolChoice::None)
 }
 
 fn should_use_model_orchestration(request: &NormalizedRequest, policy: &KernelPolicy) -> bool {
@@ -1585,6 +1730,7 @@ fn child_agent_input(request: &NormalizedRequest, task: &SubtaskSpec) -> String 
         - Return a compact intermediate artifact, not a chat transcript.\n\
         - You do not have tool access in this worker turn; do not request, invent, or simulate tool calls.\n\
         - Do not say you will inspect files, run commands, browse, or write code unless the evidence is already present in the root-visible context.\n\
+        - Do not return spawn_plan JSON or orchestration schemas; planning is already complete.\n\
         - Focus only on this child objective. Prefer concrete findings, constraints, risks, and the next root-visible action if one is needed.\n\
         - Keep the artifact concise: at most 6 short bullets or one small JSON object. No hidden reasoning and no orchestration commentary.";
     if original.trim().is_empty() {
@@ -1608,8 +1754,11 @@ fn root_tool_continuation_input(
 ) -> String {
     let original = agent_visible_context(request);
     let artifact_text = synthesize_text(artifacts);
+    let tool_policy = stateful_tool_policy_instruction(request)
+        .map(|policy| format!("\n\nTool selection guardrails:\n{policy}"))
+        .unwrap_or_default();
     format!(
-        "User request and current root-visible tool context:\n{original}\n\nWorker-agent findings available to the root leader:\n{artifact_text}\n\nUse these findings to continue the task. If any command, file edit, retrieval, or verification is still needed, emit the next root-visible tool call now. Produce a final answer only when the requested work is actually complete."
+        "User request and current root-visible tool context:\n{original}\n\nWorker-agent findings available to the root leader:\n{artifact_text}{tool_policy}\n\nUse these findings to continue the task. Before emitting a tool call, compare it against the root-visible tool context and do not rerun a command or equivalent validation whose successful result is already present. If the requested artifacts exist and a relevant validation succeeded, produce the final answer now. Emit another root-visible tool call only for a concrete missing artifact, failed validation, or unresolved error. When concrete environment work remains, use a direct execution or observation tool; planning/status-only tools should not delay file creation, command execution, retrieval, or validation. Batch safe related shell steps into one cohesive command/script when that reduces round trips without hiding failures."
     )
 }
 
@@ -2336,6 +2485,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_tool_turn_orchestrates_before_first_root_tool_call() {
+        let mut request = text_request("create files with shell commands and verify the result");
+        request.tools = vec![ToolDefinition {
+            name: "exec_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let provider = ToolResultOrderProvider::default();
+        let calls = provider.calls.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(!output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 16);
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].tool_name, "exec_command");
+
+        let calls = calls.lock().unwrap();
+        assert!(calls[0].contains("orchestration plan"), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("continue root-visible tool execution")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls[0].contains("continue root-visible tool execution"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn stateful_tool_policy_blocks_invented_session_handles() {
+        let mut request = text_request("continue the previous command");
+        request.tools = vec![
+            ToolDefinition {
+                name: "exec_command".to_string(),
+                description: Some("run a shell command".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"]
+                }),
+            },
+            ToolDefinition {
+                name: "continue_active_operation".to_string(),
+                description: Some("send input to an existing operation".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "integer"},
+                        "chars": {"type": "string"}
+                    },
+                    "required": ["session_id", "chars"]
+                }),
+            },
+        ];
+
+        let instructions =
+            system_instructions_with_policy(&request, &KernelPolicy::default()).join("\n");
+
+        assert!(instructions.contains("Stateful tool policy"));
+        assert!(instructions.contains("continue_active_operation"));
+        assert!(instructions.contains("session_id"));
+        assert!(instructions.contains("Do not invent numeric IDs"));
+        assert!(instructions.contains("No state handle IDs have been observed"));
+    }
+
+    #[test]
+    fn stateful_tool_policy_lists_observed_handles_from_tool_results() {
+        let mut request = text_request("continue the running command");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "continue_active_operation".to_string(),
+            description: Some("send input to an existing operation".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "integer"},
+                    "chars": {"type": "string"}
+                },
+                "required": ["session_id", "chars"]
+            }),
+        }];
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-run"),
+            scope,
+            result_json: serde_json::json!({
+                "status": "in_progress",
+                "session_id": 42,
+                "stdout": ""
+            }),
+            result_sha256: "result-hash".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+
+        let instructions =
+            system_instructions_with_policy(&request, &KernelPolicy::default()).join("\n");
+
+        assert!(instructions.contains("Observed state handle IDs"));
+        assert!(instructions.contains("session_id=42"));
+    }
+
+    #[test]
+    fn root_tool_continuation_prompt_stops_redundant_tool_loops() {
+        let mut request = text_request("create and verify an artifact");
+        let scope = request.isolation_key();
+        request.tools = vec![ToolDefinition {
+            name: "run_command".to_string(),
+            description: Some("run a shell command".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"]
+            }),
+        }];
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Assistant,
+            content: vec![NormalizedContentPart::ToolCall {
+                tool_call_id: ToolCallId::from("call-create"),
+                tool_name: "run_command".to_string(),
+                arguments_json: serde_json::json!({"cmd": "create artifact && verify artifact"}),
+            }],
+        });
+        request.messages.push(NormalizedMessage {
+            role: MessageRole::Tool,
+            content: vec![NormalizedContentPart::ToolResult {
+                tool_call_id: ToolCallId::from("call-create"),
+            }],
+        });
+        request.tool_results = vec![ToolResultRecord {
+            tool_call_id: ToolCallId::from("call-create"),
+            scope,
+            result_json: serde_json::json!({
+                "exit_code": 0,
+                "stdout": "artifact created\nvalidation successful\n"
+            }),
+            result_sha256: "result-hash".to_string(),
+            status: ToolResultStatus::Accepted,
+        }];
+        let artifacts = vec![AgentArtifact::Text {
+            id: ArtifactId::from("finding"),
+            scope: request.isolation_key(),
+            text: "Worker confirms the artifact exists and validation passed.".to_string(),
+        }];
+
+        let prompt = root_tool_continuation_input(&request, &artifacts);
+
+        assert!(prompt.contains("do not rerun a command or equivalent validation"));
+        assert!(prompt.contains("requested artifacts exist and a relevant validation succeeded"));
+        assert!(prompt.contains("produce the final answer now"));
+        assert!(prompt.contains("failed validation"));
+        assert!(prompt.contains("planning/status-only tools should not delay"));
+        assert!(prompt.contains("Batch safe related shell steps into one cohesive command/script"));
+    }
+
+    #[test]
+    fn child_agent_contract_rejects_spawn_plan_output() {
+        let request = text_request("verify a generated artifact");
+        let task = model_child("verify-script", "verify generated script");
+
+        let prompt = child_agent_input(&request, &task);
+
+        assert!(prompt.contains("Do not return spawn_plan JSON"));
+    }
+
+    #[tokio::test]
     async fn invalid_model_plan_is_rejected_without_root_fallback() {
         let request = text_request("complex request with an invalid planning response");
         let runner = KernelRunner::new(InvalidPlannerProvider, KernelPolicy::default());
@@ -2811,14 +3128,21 @@ mod tests {
 
         assert!(output.verification.passed);
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.first().map(String::as_str), Some("Leader:1"));
+        assert_eq!(seen.first().map(String::as_str), Some("Leader:0"));
+        assert_eq!(
+            seen.iter()
+                .filter(|entry| entry.as_str() == "Leader:1")
+                .count(),
+            1
+        );
         assert_eq!(
             seen.iter()
                 .filter(|entry| entry.as_str() == "Worker:0")
                 .count(),
             16
         );
-        assert_eq!(seen.last().map(String::as_str), Some("Synthesizer:0"));
+        assert!(!seen.iter().any(|entry| entry == "Worker:1"));
+        assert!(!seen.iter().any(|entry| entry == "Synthesizer:1"));
     }
 
     #[tokio::test]
@@ -3090,7 +3414,7 @@ mod tests {
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
             match request.task.role {
-                AgentRole::Leader => {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
                     let target = target_child_agents(&request);
                     Ok(ProviderResponse {
                         artifacts: vec![AgentArtifact::SpawnPlan {
@@ -4147,7 +4471,7 @@ mod tests {
                 request.tools.len()
             ));
             match request.task.role {
-                AgentRole::Leader => {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
                     let target = target_child_agents(&request);
                     Ok(ProviderResponse {
                         artifacts: vec![AgentArtifact::SpawnPlan {
@@ -4172,7 +4496,8 @@ mod tests {
                         usage: Default::default(),
                     })
                 }
-                AgentRole::Worker
+                AgentRole::Leader
+                | AgentRole::Worker
                 | AgentRole::ReasoningSummarizer
                 | AgentRole::Synthesizer
                 | AgentRole::Verifier => Ok(ProviderResponse {
