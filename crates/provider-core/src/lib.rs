@@ -76,10 +76,71 @@ pub enum ProviderFinishReason {
     Other(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderError {
     #[error("provider rejected request: {0}")]
     Rejected(String),
+    #[error("{provider} HTTP {status}: {message}")]
+    Http {
+        provider: String,
+        status: u16,
+        code: Option<String>,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
+    #[error("{provider} transport error: {message}")]
+    Transport {
+        provider: String,
+        message: String,
+        retryable: bool,
+    },
+    #[error("{provider} returned an invalid response: {message}")]
+    InvalidResponse { provider: String, message: String },
+    #[error("provider circuit is open for {retry_after_ms} ms")]
+    CircuitOpen { retry_after_ms: u64 },
+    #[error("provider admission queue exceeded {wait_ms} ms")]
+    QueueTimeout { wait_ms: u64 },
+}
+
+impl ProviderError {
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => {
+                *status == 408 || *status == 409 || *status == 429 || *status >= 500
+            }
+            Self::Transport { retryable, .. } => *retryable,
+            Self::CircuitOpen { .. } | Self::QueueTimeout { .. } => true,
+            Self::Rejected(_) | Self::InvalidResponse { .. } => false,
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Http { code, .. } => code.as_deref(),
+            Self::CircuitOpen { .. } => Some("provider_circuit_open"),
+            Self::QueueTimeout { .. } => Some("provider_queue_timeout"),
+            Self::Transport { .. } => Some("provider_transport_error"),
+            Self::InvalidResponse { .. } => Some("invalid_provider_response"),
+            Self::Rejected(_) => None,
+        }
+    }
+
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            Self::Http { retry_after_ms, .. } => *retry_after_ms,
+            Self::CircuitOpen { retry_after_ms } => Some(*retry_after_ms),
+            Self::QueueTimeout { wait_ms } => Some(*wait_ms),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]

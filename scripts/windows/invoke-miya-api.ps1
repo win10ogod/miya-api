@@ -1,6 +1,7 @@
 param(
     [string]$BaseUrl = "http://localhost:3100",
     [string]$Model = "local-model",
+    [string]$MiyaApiKey = "miya-local-key",
     [ValidateSet("none", "low", "medium", "high", "xhigh")]
     [string]$Effort = "low",
     [int]$MaxParallelAgents = 0,
@@ -28,6 +29,7 @@ if (-not $TrainingTracePath) {
 
 $RequestId = [guid]::NewGuid().ToString()
 $Headers = @{
+    "Authorization" = "Bearer $MiyaApiKey"
     "x-request-id" = $RequestId
 }
 $Body = @{

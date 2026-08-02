@@ -2,12 +2,27 @@ param(
     [string]$BindAddr = "127.0.0.1:3100",
     [string]$OpenAIBaseUrl = "http://localhost:8000/v1",
     [string]$OpenAIApiKey = "local-key",
+    [string]$MiyaApiKey = "miya-local-key",
     [string]$DefaultModel = "local-model",
     [string]$ExposedModels = "",
     [string]$GemmaModels = "",
     [string]$ContextStorePath = ".multi-agent-context\surrealkv",
+    [string]$DataDir = ".multi-agent-data",
     [int]$TenantMaxConcurrentRequests = 16,
     [int]$MaxParallelAgents = 4,
+    [int]$ProviderMaxConcurrent = 64,
+    [int]$ProviderQueueTimeoutMs = 30000,
+    [int]$ProviderMaxRetries = 2,
+    [int]$ProviderRetryBaseMs = 250,
+    [int]$ProviderCircuitFailureThreshold = 5,
+    [int]$ProviderCircuitCooldownMs = 30000,
+    [int]$RequestTimeoutMs = 60000,
+    [int]$AgentTimeoutMs = 20000,
+    [int]$MaxConcurrentJobs = 4,
+    [int]$BatchItemConcurrency = 8,
+    [bool]$SemanticVerifier = $true,
+    [int]$SemanticMaxRepairAttempts = 2,
+    [string]$OtlpEndpoint = "",
     [ValidateSet("request", "always", "never", "strip", "on", "off")]
     [string]$PublicReasoning = "always",
     [switch]$TrainingTrace,
@@ -54,6 +69,7 @@ $env:BIND_ADDR = $BindAddr
 $env:MULTI_AGENT_PROVIDER = "openai"
 $env:OPENAI_BASE_URL = $OpenAIBaseUrl
 $env:OPENAI_API_KEY = $OpenAIApiKey
+$env:MIYA_API_KEY = $MiyaApiKey
 if ($ExposedModels) {
     $env:MULTI_AGENT_MODELS = $ExposedModels
 } else {
@@ -65,8 +81,26 @@ if ($GemmaModels) {
     Remove-Item Env:MIYA_GEMMA_MODELS -ErrorAction SilentlyContinue
 }
 $env:CONTEXT_STORE_PATH = $ContextStorePath
+$env:MIYA_DATA_DIR = $DataDir
 $env:TENANT_MAX_CONCURRENT_REQUESTS = [string]$TenantMaxConcurrentRequests
 $env:MULTI_AGENT_MAX_PARALLEL_AGENTS = [string]$MaxParallelAgents
+$env:MIYA_PROVIDER_MAX_CONCURRENT = [string]$ProviderMaxConcurrent
+$env:MIYA_PROVIDER_QUEUE_TIMEOUT_MS = [string]$ProviderQueueTimeoutMs
+$env:MIYA_PROVIDER_MAX_RETRIES = [string]$ProviderMaxRetries
+$env:MIYA_PROVIDER_RETRY_BASE_MS = [string]$ProviderRetryBaseMs
+$env:MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD = [string]$ProviderCircuitFailureThreshold
+$env:MIYA_PROVIDER_CIRCUIT_COOLDOWN_MS = [string]$ProviderCircuitCooldownMs
+$env:MIYA_REQUEST_TIMEOUT_MS = [string]$RequestTimeoutMs
+$env:MIYA_AGENT_TIMEOUT_MS = [string]$AgentTimeoutMs
+$env:MIYA_MAX_CONCURRENT_JOBS = [string]$MaxConcurrentJobs
+$env:MIYA_BATCH_ITEM_CONCURRENCY = [string]$BatchItemConcurrency
+$env:MIYA_SEMANTIC_VERIFIER = if ($SemanticVerifier) { "true" } else { "false" }
+$env:MIYA_SEMANTIC_MAX_REPAIR_ATTEMPTS = [string]$SemanticMaxRepairAttempts
+if ($OtlpEndpoint) {
+    $env:OTEL_EXPORTER_OTLP_ENDPOINT = $OtlpEndpoint
+} else {
+    Remove-Item Env:OTEL_EXPORTER_OTLP_ENDPOINT -ErrorAction SilentlyContinue
+}
 $env:MIYA_PUBLIC_REASONING = $PublicReasoning
 if ($TrainingTrace) {
     $env:TRAINING_TRACE = "enabled"
@@ -99,11 +133,19 @@ try {
 
 Write-Host "OpenAI-compatible API: http://127.0.0.1:$Port/v1"
 Write-Host "Upstream backend: $OpenAIBaseUrl"
+Write-Host "Shared Miya API key: $MiyaApiKey"
 Write-Host "Default local model: $DefaultModel"
 Write-Host "Exposed models: $env:MULTI_AGENT_MODELS"
 Write-Host "Gemma-formatted models: $env:MIYA_GEMMA_MODELS"
 Write-Host "Tenant max concurrent requests: $TenantMaxConcurrentRequests"
 Write-Host "Max parallel agents: $MaxParallelAgents"
+Write-Host "Provider max concurrent calls: $ProviderMaxConcurrent"
+Write-Host "Provider queue timeout: $ProviderQueueTimeoutMs ms"
+Write-Host "Provider retries/circuit: $ProviderMaxRetries retries, threshold=$ProviderCircuitFailureThreshold cooldown=$ProviderCircuitCooldownMs ms"
+Write-Host "Request/agent timeout: $RequestTimeoutMs/$AgentTimeoutMs ms"
+Write-Host "Durable data: $DataDir; jobs=$MaxConcurrentJobs batch-item-concurrency=$BatchItemConcurrency"
+Write-Host "Semantic verifier: $SemanticVerifier; max repairs=$SemanticMaxRepairAttempts"
+Write-Host "OTLP endpoint: $OtlpEndpoint"
 Write-Host "Public reasoning mode: $PublicReasoning"
 if ($TrainingTrace) {
     Write-Host "Training trace: enabled -> $TrainingTracePath"

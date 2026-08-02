@@ -508,6 +508,10 @@ pub enum NormalizedContentPart {
     Image {
         artifact_ref: ArtifactRef,
     },
+    ProviderContent {
+        source_format: SourceFormat,
+        value: serde_json::Value,
+    },
     ToolCall {
         tool_call_id: ToolCallId,
         tool_name: String,

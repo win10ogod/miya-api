@@ -297,12 +297,19 @@ impl ModelProvider for OpenAiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+            .map_err(|error| ProviderError::Transport {
+                provider: "openai".to_string(),
+                message: error.to_string(),
+                retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+            })?;
         let value = json_or_error(response, "OpenAI chat completion")
             .await?
             .json::<serde_json::Value>()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+            .map_err(|error| ProviderError::InvalidResponse {
+                provider: "openai".to_string(),
+                message: error.to_string(),
+            })?;
 
         Self::parse_response(&scope, &task_id, value)
     }
@@ -316,7 +323,11 @@ impl ModelProvider for OpenAiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+            .map_err(|error| ProviderError::Transport {
+                provider: "openai".to_string(),
+                message: error.to_string(),
+                retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+            })?;
         let response = json_or_error(response, "OpenAI chat completion stream").await?;
 
         Ok(openai_sse_provider_stream(response))
@@ -331,15 +342,45 @@ async fn json_or_error(
         return Ok(response);
     }
 
-    let status = response.status();
+    let status = response.status().as_u16();
+    let retry_after_ms = retry_after_ms(response.headers());
     let url = response.url().to_string();
     let body = response
         .text()
         .await
         .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-    Err(ProviderError::Rejected(format!(
-        "{context} failed: HTTP {status} for {url}; body: {body}"
-    )))
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let error = value.as_ref().and_then(|value| value.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{context} failed for {url}; body: {body}"));
+    Err(ProviderError::Http {
+        provider: "openai".to_string(),
+        status,
+        code,
+        message,
+        retry_after_ms,
+    })
+}
+
+fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000))
+        .or_else(|| {
+            headers
+                .get("x-ratelimit-reset-ms")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
 }
 
 type UpstreamByteStream =
@@ -627,7 +668,26 @@ fn openai_normalized_message(
 }
 
 fn openai_assistant_message(message: &NormalizedMessage) -> serde_json::Value {
-    let text = message_text_parts(&message.content).join("\n");
+    let text = message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            NormalizedContentPart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let provider_content = message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            NormalizedContentPart::ProviderContent {
+                source_format: SourceFormat::OpenAIChat,
+                value,
+            } => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let tool_calls = message
         .content
         .iter()
@@ -648,13 +708,23 @@ fn openai_assistant_message(message: &NormalizedMessage) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
 
-    let mut value = serde_json::json!({
-        "role": "assistant",
-        "content": if text.is_empty() {
+    let content = if provider_content.is_empty() {
+        if text.is_empty() {
             serde_json::Value::Null
         } else {
             serde_json::Value::String(text)
         }
+    } else {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": text}));
+        }
+        content.extend(provider_content);
+        serde_json::Value::Array(content)
+    };
+    let mut value = serde_json::json!({
+        "role": "assistant",
+        "content": content
     });
     if !tool_calls.is_empty() {
         value["tool_calls"] = serde_json::Value::Array(tool_calls);
@@ -696,6 +766,10 @@ fn openai_content_blocks(
                         }
                     })
                 }),
+            NormalizedContentPart::ProviderContent {
+                source_format,
+                value,
+            } => Some(openai_provider_content(source_format, value)),
             NormalizedContentPart::ToolCall { .. } | NormalizedContentPart::ToolResult { .. } => {
                 None
             }
@@ -705,6 +779,26 @@ fn openai_content_blocks(
     serde_json::Value::Array(content)
 }
 
+fn openai_provider_content(
+    source_format: &SourceFormat,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    if source_format == &SourceFormat::OpenAIChat {
+        return value.clone();
+    }
+    if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+        return serde_json::json!({"type": "text", "text": text});
+    }
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("provider_content");
+    serde_json::json!({
+        "type": "text",
+        "text": format!("[{kind} content preserved from Anthropic input] {}", value)
+    })
+}
+
 fn openai_role(role: &MessageRole) -> &'static str {
     match role {
         MessageRole::System => "system",
@@ -712,16 +806,6 @@ fn openai_role(role: &MessageRole) -> &'static str {
         MessageRole::Assistant => "assistant",
         MessageRole::Tool => "tool",
     }
-}
-
-fn message_text_parts(parts: &[NormalizedContentPart]) -> Vec<String> {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            NormalizedContentPart::Text { text } => Some(text.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 fn tool_result_json(tool_call_id: &ToolCallId, request: &ProviderRequest) -> serde_json::Value {

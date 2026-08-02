@@ -1,6 +1,7 @@
 param(
     [string]$BaseUrl = "http://127.0.0.1:3100",
-    [string]$Model = "local-model"
+    [string]$Model = "local-model",
+    [string]$MiyaApiKey = "miya-local-key"
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,11 +9,21 @@ $ErrorActionPreference = "Stop"
 $Health = Invoke-RestMethod -Uri "$BaseUrl/health" -Method Get -TimeoutSec 10
 Write-Host "health=$($Health.status)"
 
-$Models = Invoke-RestMethod -Uri "$BaseUrl/v1/models" -Method Get -TimeoutSec 10
+$Headers = @{
+    "Authorization" = "Bearer $MiyaApiKey"
+}
+
+$Models = Invoke-RestMethod -Uri "$BaseUrl/v1/models" -Method Get -Headers $Headers -TimeoutSec 10
 if (-not ($Models.data.id -contains $Model)) {
     throw "$Model was not exposed by /v1/models"
 }
 Write-Host "models include $Model"
+
+$Metrics = Invoke-WebRequest -Uri "$BaseUrl/metrics" -Method Get -Headers $Headers -TimeoutSec 10
+if (-not $Metrics.Content.Contains("miya_provider_attempts_total")) {
+    throw "/metrics did not return Miya Prometheus counters"
+}
+Write-Host "prometheus metrics ok"
 
 $Body = @{
     model = $Model
@@ -33,6 +44,7 @@ $Response = Invoke-RestMethod `
     -Uri "$BaseUrl/v1/chat/completions" `
     -Method Post `
     -ContentType "application/json" `
+    -Headers $Headers `
     -Body $Body `
     -TimeoutSec 120
 

@@ -1,45 +1,75 @@
+mod batch_api;
+mod durable;
+mod observability;
+
+use batch_api::*;
+pub use observability::ObservabilityGuard;
+
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     convert::Infallible,
     fs::{self, OpenOptions},
+    future::Future,
     io::Write,
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use agent_kernel::{KernelOutput, KernelPolicy, KernelRunner, KernelTraceEvent, MockProvider};
+use agent_kernel::{
+    KernelError, KernelOutput, KernelPolicy, KernelRunner, KernelTraceEvent, MockProvider,
+};
 use agent_protocol::*;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        FromRequestParts, Path, Query, State,
+        DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, Request, State,
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header, request::Parts},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, SecondsFormat, Utc};
 use context_store::{
     ContextAppendRecord, ContextAssembly, ContextAssemblyOptions, DEFAULT_MAX_CHUNKS,
     DEFAULT_MAX_CONTEXT_BYTES, DEFAULT_RECENT_TAIL_CHUNKS, SurrealKvContextStore,
 };
-use futures::{Stream, StreamExt, future::join_all};
+use durable::DurableStore;
+use futures::{Stream, StreamExt};
 use provider_anthropic::AnthropicProvider;
 use provider_core::{
-    ModelProvider, ProviderFinishReason, ProviderStream, ProviderStreamEvent, ProviderUsage,
+    ModelProvider, ProviderError, ProviderFinishReason, ProviderStream, ProviderStreamEvent,
+    ProviderUsage,
 };
 use provider_openai::OpenAiProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
-const MAX_BATCH_REQUESTS: usize = 64;
+const MAX_OPENAI_BATCH_REQUESTS: usize = 50_000;
+const MAX_ANTHROPIC_BATCH_REQUESTS: usize = 100_000;
+const MAX_OPENAI_FILE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_OPENAI_BATCH_FILE_BYTES: usize = 200 * 1024 * 1024;
 const DEFAULT_TENANT_ID: &str = "default";
 const DEFAULT_TENANT_MAX_CONCURRENT_REQUESTS: usize = 16;
+const OPENAI_FILES_NAMESPACE: &str = "openai_files";
+const OPENAI_FILE_BLOBS_NAMESPACE: &str = "openai_file_blobs";
+const OPENAI_BATCHES_NAMESPACE: &str = "openai_batches";
+const ANTHROPIC_BATCHES_NAMESPACE: &str = "anthropic_message_batches";
+const ANTHROPIC_BATCH_INPUTS_NAMESPACE: &str = "anthropic_message_batch_inputs";
+const ANTHROPIC_BATCH_RESULTS_NAMESPACE: &str = "anthropic_message_batch_results";
+const BACKGROUND_RESPONSES_NAMESPACE: &str = "openai_background_responses";
+const BACKGROUND_RESPONSE_INPUTS_NAMESPACE: &str = "openai_background_response_inputs";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ApiError {
@@ -79,11 +109,6 @@ pub struct OpenAiChatRequest {
     pub metadata: serde_json::Value,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct OpenAiChatBatchRequest {
-    pub requests: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -135,6 +160,8 @@ pub struct OpenAiResponsesRequest {
     pub top_logprobs: Option<u64>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub background: bool,
     #[serde(default)]
     pub store: Option<bool>,
     #[serde(default)]
@@ -194,8 +221,25 @@ pub enum OpenAiContent {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OpenAiContentPart {
-    Text { text: String },
-    ImageUrl { image_url: OpenAiImageUrl },
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: OpenAiImageUrl,
+    },
+    InputAudio {
+        input_audio: serde_json::Value,
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>,
+    },
+    File {
+        file: serde_json::Value,
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>,
+    },
+    Refusal {
+        refusal: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -242,11 +286,6 @@ pub struct AnthropicMessagesRequest {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct AnthropicMessagesBatchRequest {
-    pub requests: Vec<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum AnthropicSystem {
     Text(String),
@@ -266,8 +305,7 @@ pub enum AnthropicContent {
     Blocks(Vec<AnthropicContentBlock>),
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, Debug)]
 pub enum AnthropicContentBlock {
     Text {
         text: String,
@@ -284,6 +322,100 @@ pub enum AnthropicContentBlock {
         tool_use_id: String,
         content: serde_json::Value,
     },
+    ProviderContent {
+        value: serde_json::Value,
+    },
+}
+
+impl<'de> Deserialize<'de> for AnthropicContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("Anthropic content blocks must be objects"))?;
+        let kind = object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| D::Error::custom("Anthropic content blocks must include type"))?;
+        match kind {
+            "text"
+                if object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "text")) =>
+            {
+                let text = object
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| D::Error::custom("text block must include text"))?;
+                Ok(Self::Text {
+                    text: text.to_string(),
+                })
+            }
+            "image"
+                if object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "source")) =>
+            {
+                let source = serde_json::from_value(
+                    object
+                        .get("source")
+                        .cloned()
+                        .ok_or_else(|| D::Error::custom("image block must include source"))?,
+                )
+                .map_err(D::Error::custom)?;
+                Ok(Self::Image { source })
+            }
+            "tool_use"
+                if object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "id" | "name" | "input")) =>
+            {
+                Ok(Self::ToolUse {
+                    id: object
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| D::Error::custom("tool_use block must include id"))?
+                        .to_string(),
+                    name: object
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| D::Error::custom("tool_use block must include name"))?
+                        .to_string(),
+                    input: object
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                })
+            }
+            "tool_result"
+                if object.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "type" | "tool_use_id" | "content" | "is_error"
+                    )
+                }) =>
+            {
+                Ok(Self::ToolResult {
+                    tool_use_id: object
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            D::Error::custom("tool_result block must include tool_use_id")
+                        })?
+                        .to_string(),
+                    content: object
+                        .get("content")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                })
+            }
+            _ => Ok(Self::ProviderContent { value }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -314,6 +446,205 @@ pub struct CompatibilityErrorBody {
     pub code: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredOpenAiFile {
+    tenant_id: String,
+    id: String,
+    bytes: u64,
+    created_at: u64,
+    filename: String,
+    purpose: String,
+    status: String,
+    expires_at: Option<u64>,
+    status_details: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OpenAiBatchRecord {
+    tenant_id: String,
+    id: String,
+    completion_window: String,
+    created_at: u64,
+    endpoint: String,
+    input_file_id: String,
+    status: String,
+    cancelled_at: Option<u64>,
+    cancelling_at: Option<u64>,
+    completed_at: Option<u64>,
+    error_file_id: Option<String>,
+    errors: Option<serde_json::Value>,
+    expired_at: Option<u64>,
+    expires_at: Option<u64>,
+    failed_at: Option<u64>,
+    finalizing_at: Option<u64>,
+    in_progress_at: Option<u64>,
+    metadata: serde_json::Value,
+    output_file_id: Option<String>,
+    request_counts: OpenAiBatchRequestCounts,
+    usage: ProviderUsage,
+    cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct OpenAiBatchRequestCounts {
+    total: u64,
+    completed: u64,
+    failed: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AnthropicBatchRecord {
+    tenant_id: String,
+    id: String,
+    created_at: u64,
+    expires_at: u64,
+    ended_at: Option<u64>,
+    cancel_initiated_at: Option<u64>,
+    archived_at: Option<u64>,
+    processing_status: String,
+    request_counts: AnthropicBatchRequestCounts,
+    cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct AnthropicBatchRequestCounts {
+    processing: u64,
+    succeeded: u64,
+    errored: u64,
+    canceled: u64,
+    expired: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BackgroundResponseJob {
+    tenant_id: String,
+    response_id: String,
+    created_at: u64,
+    status: String,
+    cancel_requested: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct JobRuntime {
+    running: Arc<Mutex<HashSet<String>>>,
+    cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    semaphore: Arc<Semaphore>,
+    metrics: RuntimeMetrics,
+}
+
+impl JobRuntime {
+    fn new(max_concurrent: usize, metrics: RuntimeMetrics) -> Self {
+        Self {
+            running: Arc::new(Mutex::new(HashSet::new())),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            metrics,
+        }
+    }
+
+    fn spawn<F, Fut>(&self, key: String, worker: F) -> bool
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut running = match self.running.lock() {
+            Ok(running) => running,
+            Err(_) => return false,
+        };
+        if !running.insert(key.clone()) {
+            return false;
+        }
+        drop(running);
+
+        let cancellation = CancellationToken::new();
+        if let Ok(mut cancellations) = self.cancellations.lock() {
+            cancellations.insert(key.clone(), cancellation.clone());
+        }
+        let runtime = self.clone();
+        let span = tracing::info_span!("durable.job", job.key = %key);
+        tokio::spawn(
+            async move {
+                let permit = runtime.semaphore.clone().acquire_owned().await;
+                if permit.is_ok() {
+                    runtime.metrics.jobs_started.fetch_add(1, Ordering::Relaxed);
+                    worker(cancellation).await;
+                    runtime
+                        .metrics
+                        .jobs_finished
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if let Ok(mut cancellations) = runtime.cancellations.lock() {
+                    cancellations.remove(&key);
+                }
+                if let Ok(mut running) = runtime.running.lock() {
+                    running.remove(&key);
+                }
+            }
+            .instrument(span),
+        );
+        true
+    }
+
+    fn cancel(&self, key: &str) -> bool {
+        let cancellation = self
+            .cancellations
+            .lock()
+            .ok()
+            .and_then(|cancellations| cancellations.get(key).cloned());
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            self.metrics.jobs_cancelled.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimeMetrics {
+    http_requests: Arc<AtomicU64>,
+    http_failures: Arc<AtomicU64>,
+    http_latency_micros: Arc<AtomicU64>,
+    provider_attempts: Arc<AtomicU64>,
+    provider_retries: Arc<AtomicU64>,
+    provider_failures: Arc<AtomicU64>,
+    circuit_rejections: Arc<AtomicU64>,
+    jobs_started: Arc<AtomicU64>,
+    jobs_finished: Arc<AtomicU64>,
+    jobs_cancelled: Arc<AtomicU64>,
+}
+
+impl RuntimeMetrics {
+    fn prometheus(&self) -> String {
+        format!(
+            concat!(
+                "# TYPE miya_http_requests_total counter\nmiya_http_requests_total {}\n",
+                "# TYPE miya_http_failures_total counter\nmiya_http_failures_total {}\n",
+                "# TYPE miya_http_request_duration_microseconds_total counter\nmiya_http_request_duration_microseconds_total {}\n",
+                "# TYPE miya_provider_attempts_total counter\nmiya_provider_attempts_total {}\n",
+                "# TYPE miya_provider_retries_total counter\nmiya_provider_retries_total {}\n",
+                "# TYPE miya_provider_failures_total counter\nmiya_provider_failures_total {}\n",
+                "# TYPE miya_provider_circuit_rejections_total counter\nmiya_provider_circuit_rejections_total {}\n",
+                "# TYPE miya_durable_jobs_started_total counter\nmiya_durable_jobs_started_total {}\n",
+                "# TYPE miya_durable_jobs_finished_total counter\nmiya_durable_jobs_finished_total {}\n",
+                "# TYPE miya_durable_jobs_cancelled_total counter\nmiya_durable_jobs_cancelled_total {}\n"
+            ),
+            self.http_requests.load(Ordering::Relaxed),
+            self.http_failures.load(Ordering::Relaxed),
+            self.http_latency_micros.load(Ordering::Relaxed),
+            self.provider_attempts.load(Ordering::Relaxed),
+            self.provider_retries.load(Ordering::Relaxed),
+            self.provider_failures.load(Ordering::Relaxed),
+            self.circuit_rejections.load(Ordering::Relaxed),
+            self.jobs_started.load(Ordering::Relaxed),
+            self.jobs_finished.load(Ordering::Relaxed),
+            self.jobs_cancelled.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     kernel: Arc<KernelRunner<Arc<dyn ModelProvider>>>,
@@ -323,6 +654,10 @@ pub struct AppState {
     tenant_limiter: TenantConcurrencyLimiter,
     training_trace: TrainingTraceRecorder,
     public_reasoning_mode: PublicReasoningMode,
+    shared_api_key: Option<Arc<str>>,
+    durable: DurableStore,
+    jobs: JobRuntime,
+    metrics: RuntimeMetrics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -565,6 +900,7 @@ impl AppState {
         policy: KernelPolicy,
     ) -> Self {
         let responses = ResponsesStore::new(context.store.clone());
+        let metrics = RuntimeMetrics::default();
         Self {
             kernel: Arc::new(KernelRunner::new(provider, policy)),
             context,
@@ -573,6 +909,10 @@ impl AppState {
             tenant_limiter,
             training_trace,
             public_reasoning_mode: PublicReasoningMode::Request,
+            shared_api_key: None,
+            durable: DurableStore::memory(),
+            jobs: JobRuntime::new(4, metrics.clone()),
+            metrics,
         }
     }
 }
@@ -679,18 +1019,331 @@ impl TrainingTraceRecorder {
 }
 
 #[derive(Clone)]
+pub struct ProviderAdmission {
+    semaphore: Option<Arc<Semaphore>>,
+    wait_timeout: Duration,
+}
+
+impl ProviderAdmission {
+    pub fn disabled() -> Self {
+        Self {
+            semaphore: None,
+            wait_timeout: Duration::from_secs(30),
+        }
+    }
+
+    fn from_env() -> Result<Self, String> {
+        let max_concurrent = env_optional_usize(
+            &[
+                "MIYA_PROVIDER_MAX_CONCURRENT",
+                "PROVIDER_MAX_CONCURRENT_REQUESTS",
+            ],
+            64,
+        )?;
+        let wait_timeout_ms = env_optional_u64(
+            &[
+                "MIYA_PROVIDER_QUEUE_TIMEOUT_MS",
+                "PROVIDER_QUEUE_TIMEOUT_MS",
+            ],
+            30_000,
+        )?;
+        Ok(Self {
+            semaphore: (max_concurrent > 0).then(|| Arc::new(Semaphore::new(max_concurrent))),
+            wait_timeout: Duration::from_millis(wait_timeout_ms.max(1)),
+        })
+    }
+
+    async fn acquire(&self) -> Result<ProviderAdmissionPermit, String> {
+        let Some(semaphore) = &self.semaphore else {
+            return Ok(ProviderAdmissionPermit { _permit: None });
+        };
+        let permit = tokio::time::timeout(self.wait_timeout, semaphore.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                format!(
+                    "provider queue wait exceeded {} ms",
+                    self.wait_timeout.as_millis()
+                )
+            })?
+            .map_err(|_| "provider concurrency limiter was closed".to_string())?;
+        Ok(ProviderAdmissionPermit {
+            _permit: Some(permit),
+        })
+    }
+}
+
+struct ProviderAdmissionPermit {
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+struct AdmissionProvider {
+    inner: Arc<dyn ModelProvider>,
+    admission: ProviderAdmission,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for AdmissionProvider {
+    async fn invoke(
+        &self,
+        request: provider_core::ProviderRequest,
+    ) -> Result<provider_core::ProviderResponse, provider_core::ProviderError> {
+        let _permit =
+            self.admission
+                .acquire()
+                .await
+                .map_err(|message| ProviderError::QueueTimeout {
+                    wait_ms: provider_queue_wait_ms(&message),
+                })?;
+        self.inner.invoke(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: provider_core::ProviderRequest,
+    ) -> Result<ProviderStream, provider_core::ProviderError> {
+        let permit =
+            self.admission
+                .acquire()
+                .await
+                .map_err(|message| ProviderError::QueueTimeout {
+                    wait_ms: provider_queue_wait_ms(&message),
+                })?;
+        let stream = self.inner.stream(request).await?;
+        Ok(Box::pin(stream.map(move |event| {
+            let _hold_permit = &permit;
+            event
+        })))
+    }
+}
+
+fn provider_queue_wait_ms(message: &str) -> u64 {
+    message
+        .split_whitespace()
+        .find_map(|part| part.parse::<u64>().ok())
+        .unwrap_or(30_000)
+}
+
+#[derive(Clone, Debug)]
+pub struct ResilienceConfig {
+    max_retries: usize,
+    base_delay: Duration,
+    circuit_failure_threshold: u32,
+    circuit_cooldown: Duration,
+}
+
+impl ResilienceConfig {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            max_retries: env_optional_usize(&["MIYA_PROVIDER_MAX_RETRIES"], 2)?,
+            base_delay: Duration::from_millis(env_optional_u64(
+                &["MIYA_PROVIDER_RETRY_BASE_MS"],
+                250,
+            )?),
+            circuit_failure_threshold: env_optional_u64(
+                &["MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD"],
+                5,
+            )?
+            .try_into()
+            .map_err(|_| "MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD is too large".to_string())?,
+            circuit_cooldown: Duration::from_millis(env_optional_u64(
+                &["MIYA_PROVIDER_CIRCUIT_COOLDOWN_MS"],
+                30_000,
+            )?),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CircuitBreaker {
+    state: Arc<Mutex<CircuitState>>,
+}
+
+#[derive(Debug, Default)]
+struct CircuitState {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    half_open_probe: bool,
+}
+
+impl CircuitBreaker {
+    fn before_request(&self) -> Result<(), ProviderError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProviderError::Rejected("circuit breaker lock poisoned".to_string()))?;
+        let Some(open_until) = state.open_until else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < open_until {
+            return Err(ProviderError::CircuitOpen {
+                retry_after_ms: open_until.duration_since(now).as_millis() as u64,
+            });
+        }
+        if state.half_open_probe {
+            return Err(ProviderError::CircuitOpen {
+                retry_after_ms: 100,
+            });
+        }
+        state.half_open_probe = true;
+        Ok(())
+    }
+
+    fn record_success(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = CircuitState::default();
+        }
+    }
+
+    fn record_failure(&self, config: &ResilienceConfig) {
+        if let Ok(mut state) = self.state.lock() {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.half_open_probe
+                || state.consecutive_failures >= config.circuit_failure_threshold.max(1)
+            {
+                state.open_until = Some(Instant::now() + config.circuit_cooldown);
+                state.half_open_probe = false;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResilientProvider {
+    inner: Arc<dyn ModelProvider>,
+    config: ResilienceConfig,
+    circuit: CircuitBreaker,
+    metrics: RuntimeMetrics,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ResilientProvider {
+    async fn invoke(
+        &self,
+        request: provider_core::ProviderRequest,
+    ) -> Result<provider_core::ProviderResponse, ProviderError> {
+        self.circuit.before_request().inspect_err(|_| {
+            self.metrics
+                .circuit_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        })?;
+        let mut attempt = 0_usize;
+        loop {
+            self.metrics
+                .provider_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            match self.inner.invoke(request.clone()).await {
+                Ok(response) => {
+                    self.circuit.record_success();
+                    return Ok(response);
+                }
+                Err(error) if error.retryable() && attempt < self.config.max_retries => {
+                    self.metrics
+                        .provider_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    let delay = provider_retry_delay(&self.config, &error, attempt);
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    self.metrics
+                        .provider_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if error.retryable() {
+                        self.circuit.record_failure(&self.config);
+                    } else {
+                        self.circuit.record_success();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn stream(
+        &self,
+        request: provider_core::ProviderRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.circuit.before_request().inspect_err(|_| {
+            self.metrics
+                .circuit_rejections
+                .fetch_add(1, Ordering::Relaxed);
+        })?;
+        let mut attempt = 0_usize;
+        loop {
+            self.metrics
+                .provider_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            match self.inner.stream(request.clone()).await {
+                Ok(stream) => {
+                    self.circuit.record_success();
+                    return Ok(stream);
+                }
+                Err(error) if error.retryable() && attempt < self.config.max_retries => {
+                    self.metrics
+                        .provider_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    let delay = provider_retry_delay(&self.config, &error, attempt);
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    self.metrics
+                        .provider_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if error.retryable() {
+                        self.circuit.record_failure(&self.config);
+                    } else {
+                        self.circuit.record_success();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn provider_retry_delay(
+    config: &ResilienceConfig,
+    error: &ProviderError,
+    attempt: usize,
+) -> Duration {
+    if let Some(retry_after_ms) = error.retry_after_ms() {
+        return Duration::from_millis(retry_after_ms.min(120_000));
+    }
+    let exponent = attempt.min(10) as u32;
+    let base_ms = config.base_delay.as_millis() as u64;
+    let jitter = telemetry_timestamp_ms() % 101;
+    Duration::from_millis(
+        base_ms
+            .saturating_mul(2_u64.saturating_pow(exponent))
+            .saturating_add(jitter)
+            .min(30_000),
+    )
+}
+
+#[derive(Clone)]
 pub enum DirectBackend {
     Mock,
     OpenAi {
         client: reqwest::Client,
         base_url: String,
         api_key: String,
+        admission: ProviderAdmission,
+        resilience: ResilienceConfig,
+        circuit: CircuitBreaker,
+        metrics: RuntimeMetrics,
     },
     Anthropic {
         client: reqwest::Client,
         base_url: String,
         api_key: String,
         api_version: String,
+        admission: ProviderAdmission,
+        resilience: ResilienceConfig,
+        circuit: CircuitBreaker,
+        metrics: RuntimeMetrics,
     },
 }
 
@@ -968,8 +1621,23 @@ struct TenantConcurrencyPermit {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+fn direct_http_client() -> Result<reqwest::Client, String> {
+    let request_timeout_secs = env_optional_u64(&["MIYA_PROVIDER_TIMEOUT_SECS"], 300)?;
+    let connect_timeout_secs = env_optional_u64(&["MIYA_PROVIDER_CONNECT_TIMEOUT_SECS"], 30)?;
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(request_timeout_secs.max(1)))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs.max(1)))
+        .build()
+        .map_err(|error| format!("failed to build direct provider HTTP client: {error}"))
+}
+
 impl DirectBackend {
-    fn from_env(provider_kind: &str) -> Result<Self, String> {
+    fn from_env(
+        provider_kind: &str,
+        admission: ProviderAdmission,
+        resilience: ResilienceConfig,
+        metrics: RuntimeMetrics,
+    ) -> Result<Self, String> {
         match provider_kind {
             "mock" => Ok(Self::Mock),
             "openai" => {
@@ -978,9 +1646,13 @@ impl DirectBackend {
                 let base_url = std::env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
                 Ok(Self::OpenAi {
-                    client: reqwest::Client::new(),
+                    client: direct_http_client()?,
                     base_url: base_url.trim_end_matches('/').to_string(),
                     api_key,
+                    admission,
+                    resilience,
+                    circuit: CircuitBreaker::default(),
+                    metrics,
                 })
             }
             "anthropic" => {
@@ -991,43 +1663,64 @@ impl DirectBackend {
                 let api_version =
                     std::env::var("ANTHROPIC_VERSION").unwrap_or_else(|_| "2023-06-01".to_string());
                 Ok(Self::Anthropic {
-                    client: reqwest::Client::new(),
+                    client: direct_http_client()?,
                     base_url: base_url.trim_end_matches('/').to_string(),
                     api_key,
                     api_version,
+                    admission,
+                    resilience,
+                    circuit: CircuitBreaker::default(),
+                    metrics,
                 })
             }
             other => Err(format!("unsupported direct provider={other}")),
         }
     }
 
-    async fn openai_chat(&self, request: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn openai_chat(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
         match self {
             Self::Mock => Ok(mock_direct_openai_response(&request)),
             Self::OpenAi {
                 client,
                 base_url,
                 api_key,
+                admission,
+                resilience,
+                circuit,
+                metrics,
             } => {
                 let request = sanitize_direct_openai_request(request);
                 let tool_names = openai_request_tool_names(&request);
-                post_json(
-                    client
-                        .post(format!("{base_url}/chat/completions"))
-                        .bearer_auth(api_key),
-                    request,
+                resilient_direct_json(
+                    "openai",
+                    admission,
+                    resilience,
+                    circuit,
+                    metrics,
+                    || {
+                        client
+                            .post(format!("{base_url}/chat/completions"))
+                            .bearer_auth(api_key)
+                            .json(&request)
+                    },
                 )
                 .await
                 .map(|response| strip_direct_openai_response_with_tools(response, &tool_names))
             }
-            Self::Anthropic { .. } => Err(
+            Self::Anthropic { .. } => Err(ProviderError::Rejected(
                 "reasoning.effort=none on /v1/chat/completions requires MULTI_AGENT_PROVIDER=openai"
                     .to_string(),
-            ),
+            )),
         }
     }
 
-    async fn openai_chat_stream(&self, request: serde_json::Value) -> Result<Response, String> {
+    async fn openai_chat_stream(
+        &self,
+        request: serde_json::Value,
+    ) -> Result<Response, ProviderError> {
         match self {
             Self::Mock => Ok(openai_stream_response_from_completion(
                 mock_direct_openai_response(&request),
@@ -1036,28 +1729,42 @@ impl DirectBackend {
                 client,
                 base_url,
                 api_key,
+                admission,
+                resilience,
+                circuit,
+                metrics,
             } => {
-                let response = client
-                    .post(format!("{base_url}/chat/completions"))
-                    .bearer_auth(api_key)
-                    .json(&sanitize_direct_openai_request(request))
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let response = direct_response_or_error(response).await?;
-                Ok(upstream_sse_response(response))
+                let request = sanitize_direct_openai_request(request);
+                let (response, provider_permit) = resilient_direct_send(
+                    "openai",
+                    admission,
+                    resilience,
+                    circuit,
+                    metrics,
+                    || {
+                        client
+                            .post(format!("{base_url}/chat/completions"))
+                            .bearer_auth(api_key)
+                            .json(&request)
+                    },
+                )
+                .await?;
+                Ok(response_with_provider_permit(
+                    upstream_sse_response(response),
+                    provider_permit,
+                ))
             }
-            Self::Anthropic { .. } => Err(
+            Self::Anthropic { .. } => Err(ProviderError::Rejected(
                 "reasoning.effort=none on /v1/chat/completions requires MULTI_AGENT_PROVIDER=openai"
                     .to_string(),
-            ),
+            )),
         }
     }
 
     async fn anthropic_messages(
         &self,
         request: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, ProviderError> {
         match self {
             Self::Mock => Ok(mock_direct_anthropic_response(&request)),
             Self::Anthropic {
@@ -1065,26 +1772,33 @@ impl DirectBackend {
                 base_url,
                 api_key,
                 api_version,
-            } => post_json(
-                client
-                    .post(format!("{base_url}/v1/messages"))
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", api_version),
-                sanitize_direct_anthropic_request(request),
-            )
-            .await
-            .map(strip_direct_anthropic_response),
-            Self::OpenAi { .. } => Err(
+                admission,
+                resilience,
+                circuit,
+                metrics,
+            } => {
+                let request = sanitize_direct_anthropic_request(request);
+                resilient_direct_json("anthropic", admission, resilience, circuit, metrics, || {
+                    client
+                        .post(format!("{base_url}/v1/messages"))
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", api_version)
+                        .json(&request)
+                })
+                .await
+                .map(strip_direct_anthropic_response)
+            }
+            Self::OpenAi { .. } => Err(ProviderError::Rejected(
                 "reasoning.effort=none on /v1/messages requires MULTI_AGENT_PROVIDER=anthropic"
                     .to_string(),
-            ),
+            )),
         }
     }
 
     async fn anthropic_messages_stream(
         &self,
         request: serde_json::Value,
-    ) -> Result<Response, String> {
+    ) -> Result<Response, ProviderError> {
         match self {
             Self::Mock => Ok(anthropic_stream_response_from_message(
                 mock_direct_anthropic_response(&request),
@@ -1094,22 +1808,36 @@ impl DirectBackend {
                 base_url,
                 api_key,
                 api_version,
+                admission,
+                resilience,
+                circuit,
+                metrics,
             } => {
-                let response = client
-                    .post(format!("{base_url}/v1/messages"))
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", api_version)
-                    .json(&sanitize_direct_anthropic_request(request))
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let response = direct_response_or_error(response).await?;
-                Ok(upstream_sse_response(response))
+                let request = sanitize_direct_anthropic_request(request);
+                let (response, provider_permit) = resilient_direct_send(
+                    "anthropic",
+                    admission,
+                    resilience,
+                    circuit,
+                    metrics,
+                    || {
+                        client
+                            .post(format!("{base_url}/v1/messages"))
+                            .header("x-api-key", api_key)
+                            .header("anthropic-version", api_version)
+                            .json(&request)
+                    },
+                )
+                .await?;
+                Ok(response_with_provider_permit(
+                    upstream_sse_response(response),
+                    provider_permit,
+                ))
             }
-            Self::OpenAi { .. } => Err(
+            Self::OpenAi { .. } => Err(ProviderError::Rejected(
                 "reasoning.effort=none on /v1/messages requires MULTI_AGENT_PROVIDER=anthropic"
                     .to_string(),
-            ),
+            )),
         }
     }
 }
@@ -1123,38 +1851,126 @@ fn upstream_sse_response(response: reqwest::Response) -> Response {
         .unwrap_or_else(|error| internal_error_response(error.to_string()))
 }
 
-async fn post_json(
-    builder: reqwest::RequestBuilder,
-    body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let response = builder
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    direct_response_or_error(response)
-        .await?
+async fn resilient_direct_json<F>(
+    provider: &str,
+    admission: &ProviderAdmission,
+    resilience: &ResilienceConfig,
+    circuit: &CircuitBreaker,
+    metrics: &RuntimeMetrics,
+    build: F,
+) -> Result<serde_json::Value, ProviderError>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let (response, _permit) =
+        resilient_direct_send(provider, admission, resilience, circuit, metrics, build).await?;
+    response
         .json::<serde_json::Value>()
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| ProviderError::InvalidResponse {
+            provider: provider.to_string(),
+            message: error.to_string(),
+        })
+}
+
+async fn resilient_direct_send<F>(
+    provider: &str,
+    admission: &ProviderAdmission,
+    resilience: &ResilienceConfig,
+    circuit: &CircuitBreaker,
+    metrics: &RuntimeMetrics,
+    build: F,
+) -> Result<(reqwest::Response, ProviderAdmissionPermit), ProviderError>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    circuit.before_request().inspect_err(|_| {
+        metrics.circuit_rejections.fetch_add(1, Ordering::Relaxed);
+    })?;
+    let mut attempt = 0_usize;
+    loop {
+        metrics.provider_attempts.fetch_add(1, Ordering::Relaxed);
+        let result = async {
+            let permit =
+                admission
+                    .acquire()
+                    .await
+                    .map_err(|message| ProviderError::QueueTimeout {
+                        wait_ms: provider_queue_wait_ms(&message),
+                    })?;
+            let response = build()
+                .send()
+                .await
+                .map_err(|error| ProviderError::Transport {
+                    provider: provider.to_string(),
+                    message: error.to_string(),
+                    retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+                })?;
+            let response = direct_response_or_error(response, provider).await?;
+            Ok::<_, ProviderError>((response, permit))
+        }
+        .await;
+        match result {
+            Ok(result) => {
+                circuit.record_success();
+                return Ok(result);
+            }
+            Err(error) if error.retryable() && attempt < resilience.max_retries => {
+                metrics.provider_retries.fetch_add(1, Ordering::Relaxed);
+                let delay = provider_retry_delay(resilience, &error, attempt);
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => {
+                metrics.provider_failures.fetch_add(1, Ordering::Relaxed);
+                if error.retryable() {
+                    circuit.record_failure(resilience);
+                } else {
+                    circuit.record_success();
+                }
+                return Err(error);
+            }
+        }
+    }
 }
 
 async fn direct_response_or_error(
     response: reqwest::Response,
-) -> Result<reqwest::Response, String> {
+    provider: &str,
+) -> Result<reqwest::Response, ProviderError> {
     if response.status().is_success() {
         return Ok(response);
     }
 
-    let status = response.status();
-    let url = response.url().to_string();
+    let status = response.status().as_u16();
+    let retry_after_ms = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000));
     let body = response
         .text()
         .await
         .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-    Err(format!(
-        "upstream rejected request: HTTP {status} for {url}; body: {body}"
-    ))
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let error = value.as_ref().and_then(|value| value.get("error"));
+    let code = error
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or(body);
+    Err(ProviderError::Http {
+        provider: provider.to_string(),
+        status,
+        code,
+        message,
+        retry_after_ms,
+    })
 }
 
 fn sanitize_direct_openai_request(mut request: serde_json::Value) -> serde_json::Value {
@@ -2143,6 +2959,10 @@ impl ContextUsageReport {
     }
 }
 
+pub fn init_observability() -> Result<ObservabilityGuard, String> {
+    observability::init()
+}
+
 pub fn build_router() -> Router {
     build_router_with_state(AppState::default())
 }
@@ -2151,8 +2971,26 @@ pub fn build_router_from_env() -> Result<Router, String> {
     let provider_kind =
         std::env::var("MULTI_AGENT_PROVIDER").unwrap_or_else(|_| "mock".to_string());
     let provider = provider_from_kind(&provider_kind)?;
+    let provider_admission = ProviderAdmission::from_env()?;
+    let metrics = RuntimeMetrics::default();
+    let resilience = ResilienceConfig::from_env()?;
+    let admitted_provider: Arc<dyn ModelProvider> = Arc::new(AdmissionProvider {
+        inner: provider,
+        admission: provider_admission.clone(),
+    });
+    let provider: Arc<dyn ModelProvider> = Arc::new(ResilientProvider {
+        inner: admitted_provider,
+        config: resilience.clone(),
+        circuit: CircuitBreaker::default(),
+        metrics: metrics.clone(),
+    });
     let context = ApiContextManager::from_env()?;
-    let direct = DirectBackend::from_env(&provider_kind)?;
+    let direct = DirectBackend::from_env(
+        &provider_kind,
+        provider_admission,
+        resilience,
+        metrics.clone(),
+    )?;
     let tenant_limiter = TenantConcurrencyLimiter::from_env();
     let training_trace = TrainingTraceRecorder::from_env();
     let kernel_policy = kernel_policy_from_env()?;
@@ -2165,7 +3003,34 @@ pub fn build_router_from_env() -> Result<Router, String> {
         kernel_policy,
     );
     state.public_reasoning_mode = PublicReasoningMode::from_env();
+    state.shared_api_key = shared_api_key_from_env()?;
+    state.metrics = metrics;
+    let data_dir = std::env::var("MIYA_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".multi-agent-data"));
+    state.durable = DurableStore::filesystem(data_dir.clone())?;
+    if state.context.store.is_none() {
+        let response_store = SurrealKvContextStore::open(data_dir.join("responses"))
+            .map_err(|error| error.to_string())?;
+        state.responses = ResponsesStore::new(Some(Arc::new(response_store)));
+    }
+    let max_jobs = env_optional_usize(&["MIYA_MAX_CONCURRENT_JOBS"], 4)?;
+    state.jobs = JobRuntime::new(max_jobs, state.metrics.clone());
     Ok(build_router_with_state(state))
+}
+
+fn shared_api_key_from_env() -> Result<Option<Arc<str>>, String> {
+    for name in ["MIYA_API_KEY", "MIYA_SHARED_API_KEY"] {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("{name} must not be empty when configured"));
+        }
+        return Ok(Some(Arc::<str>::from(value)));
+    }
+    Ok(None)
 }
 
 fn kernel_policy_from_env() -> Result<KernelPolicy, String> {
@@ -2183,6 +3048,25 @@ fn kernel_policy_from_env() -> Result<KernelPolicy, String> {
         }
         policy.limits.max_parallel_agents = max_parallel_agents.min(64);
     }
+    if let Some(request_timeout_ms) =
+        env_u64(&["MIYA_REQUEST_TIMEOUT_MS", "MULTI_AGENT_REQUEST_TIMEOUT_MS"])?
+    {
+        policy.limits.request_timeout_ms = request_timeout_ms;
+    }
+    if let Some(agent_timeout_ms) =
+        env_u64(&["MIYA_AGENT_TIMEOUT_MS", "MULTI_AGENT_AGENT_TIMEOUT_MS"])?
+    {
+        policy.limits.agent_timeout_ms = agent_timeout_ms;
+    }
+    policy.semantic_verification.enabled = std::env::var("MIYA_SEMANTIC_VERIFIER")
+        .map(|value| env_flag_enabled(&value))
+        .unwrap_or(true);
+    policy.semantic_verification.max_repair_attempts = env_optional_u64(
+        &["MIYA_SEMANTIC_MAX_REPAIR_ATTEMPTS"],
+        u64::from(policy.semantic_verification.max_repair_attempts),
+    )?
+    .try_into()
+    .map_err(|_| "MIYA_SEMANTIC_MAX_REPAIR_ATTEMPTS must fit in u8".to_string())?;
     Ok(policy)
 }
 
@@ -2198,6 +3082,41 @@ fn env_u16(names: &[&str]) -> Result<Option<u16>, String> {
         return Ok(Some(parsed));
     }
     Ok(None)
+}
+
+fn env_u64(names: &[&str]) -> Result<Option<u64>, String> {
+    for name in names {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        let parsed = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a positive integer"))?;
+        if parsed == 0 {
+            return Err(format!("{name} must be greater than 0"));
+        }
+        return Ok(Some(parsed));
+    }
+    Ok(None)
+}
+
+fn env_optional_u64(names: &[&str], default: u64) -> Result<u64, String> {
+    for name in names {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        return value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a non-negative integer"));
+    }
+    Ok(default)
+}
+
+fn env_optional_usize(names: &[&str], default: usize) -> Result<usize, String> {
+    let value = env_optional_u64(names, default as u64)?;
+    usize::try_from(value).map_err(|_| format!("{} is too large", names[0]))
 }
 
 pub fn build_router_with_provider(provider: Arc<dyn ModelProvider>) -> Router {
@@ -2234,13 +3153,71 @@ pub fn build_router_with_provider_context_and_direct(
 }
 
 fn build_router_with_state(state: AppState) -> Router {
-    Router::new()
+    let shared_key_enabled = state.shared_api_key.is_some();
+    recover_durable_jobs(state.clone());
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/v1/v1/health", get(health))
         .route("/models", get(models))
         .route("/v1/models", get(models))
         .route("/v1/v1/models", get(models))
+        .route("/models/{model_id}", get(model_retrieve))
+        .route("/v1/models/{model_id}", get(model_retrieve))
+        .route("/v1/v1/models/{model_id}", get(model_retrieve))
+        .route("/metrics", get(metrics))
+        .route("/v1/metrics", get(metrics))
+        .route(
+            "/files",
+            get(files_list)
+                .post(files_create)
+                .layer(DefaultBodyLimit::max(MAX_OPENAI_FILE_BYTES + 1024 * 1024)),
+        )
+        .route(
+            "/v1/files",
+            get(files_list)
+                .post(files_create)
+                .layer(DefaultBodyLimit::max(MAX_OPENAI_FILE_BYTES + 1024 * 1024)),
+        )
+        .route(
+            "/v1/v1/files",
+            get(files_list)
+                .post(files_create)
+                .layer(DefaultBodyLimit::max(MAX_OPENAI_FILE_BYTES + 1024 * 1024)),
+        )
+        .route("/files/{file_id}/content", get(files_content))
+        .route("/v1/files/{file_id}/content", get(files_content))
+        .route("/v1/v1/files/{file_id}/content", get(files_content))
+        .route("/files/{file_id}", get(files_retrieve).delete(files_delete))
+        .route(
+            "/v1/files/{file_id}",
+            get(files_retrieve).delete(files_delete),
+        )
+        .route(
+            "/v1/v1/files/{file_id}",
+            get(files_retrieve).delete(files_delete),
+        )
+        .route(
+            "/batches",
+            get(openai_batches_list).post(openai_batches_create),
+        )
+        .route(
+            "/v1/batches",
+            get(openai_batches_list).post(openai_batches_create),
+        )
+        .route(
+            "/v1/v1/batches",
+            get(openai_batches_list).post(openai_batches_create),
+        )
+        .route("/batches/{batch_id}", get(openai_batches_retrieve))
+        .route("/v1/batches/{batch_id}", get(openai_batches_retrieve))
+        .route("/v1/v1/batches/{batch_id}", get(openai_batches_retrieve))
+        .route("/batches/{batch_id}/cancel", post(openai_batches_cancel))
+        .route("/v1/batches/{batch_id}/cancel", post(openai_batches_cancel))
+        .route(
+            "/v1/v1/batches/{batch_id}/cancel",
+            post(openai_batches_cancel),
+        )
         .route("/completions", post(completions))
         .route("/v1/completions", post(completions))
         .route("/v1/v1/completions", post(completions))
@@ -2289,19 +3266,150 @@ fn build_router_with_state(state: AppState) -> Router {
             "/v1/v1/responses/{response_id}",
             get(responses_retrieve).delete(responses_delete),
         )
-        .route("/chat/completions/batch", post(chat_completions_batch))
-        .route("/v1/chat/completions/batch", post(chat_completions_batch))
-        .route(
-            "/v1/v1/chat/completions/batch",
-            post(chat_completions_batch),
-        )
         .route("/messages", post(messages))
         .route("/v1/messages", post(messages))
         .route("/v1/v1/messages", post(messages))
-        .route("/messages/batch", post(messages_batch))
-        .route("/v1/messages/batch", post(messages_batch))
-        .route("/v1/v1/messages/batch", post(messages_batch))
-        .with_state(state)
+        .route("/messages/count_tokens", post(messages_count_tokens))
+        .route("/v1/messages/count_tokens", post(messages_count_tokens))
+        .route("/v1/v1/messages/count_tokens", post(messages_count_tokens))
+        .route(
+            "/v1/messages/batches",
+            get(anthropic_batches_list).post(anthropic_batches_create),
+        )
+        .route(
+            "/v1/messages/batches/{batch_id}/results",
+            get(anthropic_batches_results),
+        )
+        .route(
+            "/v1/messages/batches/{batch_id}/cancel",
+            post(anthropic_batches_cancel),
+        )
+        .route(
+            "/v1/messages/batches/{batch_id}",
+            get(anthropic_batches_retrieve).delete(anthropic_batches_delete),
+        )
+        .with_state(state.clone())
+        .layer(middleware::from_fn(observability::trace_request))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            runtime_metrics_middleware,
+        ));
+
+    if shared_key_enabled {
+        router.layer(middleware::from_fn_with_state(state, shared_api_key_auth))
+    } else {
+        router
+    }
+}
+
+async fn runtime_metrics_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let response = next.run(request).await;
+    state.metrics.http_latency_micros.fetch_add(
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    if response.status().is_client_error() || response.status().is_server_error() {
+        state.metrics.http_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    response
+}
+
+async fn shared_api_key_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if is_public_health_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let Some(expected) = state.shared_api_key.as_deref() else {
+        return next.run(request).await;
+    };
+    let provided = shared_api_key_from_headers(request.headers());
+    if provided.is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes())) {
+        return next.run(request).await;
+    }
+
+    shared_api_key_error_response(request.uri().path())
+}
+
+fn is_public_health_path(path: &str) -> bool {
+    matches!(path, "/health" | "/v1/health" | "/v1/v1/health")
+}
+
+fn shared_api_key_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (scheme, credentials) = value.trim().split_once(' ')?;
+            if scheme.eq_ignore_ascii_case("bearer") && !credentials.trim().is_empty() {
+                Some(credentials.trim())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn shared_api_key_error_response(path: &str) -> Response {
+    let response = if path.contains("/messages") {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": "invalid or missing shared API key"
+                }
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(CompatibilityError {
+                error: CompatibilityErrorBody {
+                    message: "invalid or missing shared API key".to_string(),
+                    r#type: "authentication_error".to_string(),
+                    code: "invalid_api_key".to_string(),
+                },
+            }),
+        )
+            .into_response()
+    };
+
+    let mut response = response;
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static("Bearer"),
+    );
+    response
 }
 
 fn provider_from_kind(provider_kind: &str) -> Result<Arc<dyn ModelProvider>, String> {
@@ -2326,19 +3434,49 @@ async fn health() -> Json<serde_json::Value> {
 async fn models() -> Json<serde_json::Value> {
     let data = configured_model_ids()
         .into_iter()
-        .map(|id| {
-            serde_json::json!({
-                "id": id,
-                "object": "model",
-                "owned_by": "multi-agent-api"
-            })
-        })
+        .map(model_compatibility_json)
         .collect::<Vec<_>>();
+    let first_id = data
+        .first()
+        .and_then(|model| model.get("id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_id = data
+        .last()
+        .and_then(|model| model.get("id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     Json(serde_json::json!({
         "object": "list",
-        "data": data
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id
     }))
+}
+
+async fn model_retrieve(Path(model_id): Path<String>) -> Response {
+    if configured_model_ids()
+        .iter()
+        .any(|configured| configured == &model_id)
+    {
+        Json(model_compatibility_json(model_id)).into_response()
+    } else {
+        not_found_response(format!("model not found: {model_id}"))
+    }
+}
+
+fn model_compatibility_json(id: String) -> serde_json::Value {
+    serde_json::json!({
+        "id": id.clone(),
+        "object": "model",
+        "created": 0,
+        "owned_by": "miya-api",
+        "type": "model",
+        "display_name": id,
+        "created_at": "1970-01-01T00:00:00Z"
+    })
 }
 
 fn configured_model_ids() -> Vec<String> {
@@ -2485,7 +3623,7 @@ async fn completions(
                 ),
                 tenant_permit,
             ),
-            Err(error) => internal_error_response(error.to_string()),
+            Err(error) => kernel_error_response(error),
         };
     }
 
@@ -2520,7 +3658,7 @@ async fn completions(
             attach_context_report(&mut response, prepared_context.as_ref(), context_report);
             Json(response).into_response()
         }
-        Err(error) => internal_error_response(error.to_string()),
+        Err(error) => kernel_error_response(error),
     }
 }
 
@@ -2553,7 +3691,7 @@ async fn chat_completions(
         if stream {
             return match state.direct.openai_chat_stream(provider_raw_request).await {
                 Ok(response) => response_with_tenant_permit(response, tenant_permit),
-                Err(error) => internal_error_response(error),
+                Err(error) => provider_error_response(error),
             };
         }
         return match state.direct.openai_chat(provider_raw_request).await {
@@ -2575,7 +3713,7 @@ async fn chat_completions(
                 }
                 Json(value).into_response()
             }
-            Err(error) => internal_error_response(error),
+            Err(error) => provider_error_response(error),
         };
     }
 
@@ -2607,7 +3745,7 @@ async fn chat_completions(
                 ),
                 tenant_permit,
             ),
-            Err(error) => internal_error_response(error.to_string()),
+            Err(error) => kernel_error_response(error),
         };
     }
 
@@ -2645,7 +3783,7 @@ async fn chat_completions(
             attach_context_report(&mut response, prepared_context.as_ref(), context_report);
             Json(response).into_response()
         }
-        Err(error) => internal_error_response(error.to_string()),
+        Err(error) => kernel_error_response(error),
     }
 }
 
@@ -2654,6 +3792,7 @@ async fn responses(
     headers: HeaderMap,
     Json(raw_request): Json<serde_json::Value>,
 ) -> Response {
+    let persisted_request = raw_request.clone();
     let request = match parse_openai_responses_request(raw_request) {
         Ok(request) => request,
         Err(error) => return api_error_response(error),
@@ -2664,6 +3803,10 @@ async fn responses(
         .resolve(openai_responses_public_reasoning_requested(&request));
     let request_context =
         RequestContext::from_headers(&headers).with_metadata_overrides(&request.metadata);
+    if request.background {
+        return create_background_response(state, request_context, request, persisted_request)
+            .await;
+    }
     let tenant_id = request_context.tenant_id();
     let tenant_permit = match state.tenant_limiter.acquire(&tenant_id).await {
         Ok(permit) => permit,
@@ -2715,7 +3858,7 @@ async fn responses(
                 };
                 response_with_tenant_permit(response, tenant_permit)
             }
-            Err(error) => internal_error_response(error),
+            Err(error) => provider_error_response(error),
         };
     }
 
@@ -2747,7 +3890,7 @@ async fn responses(
                 ),
                 tenant_permit,
             ),
-            Err(error) => internal_error_response(error.to_string()),
+            Err(error) => kernel_error_response(error),
         };
     }
 
@@ -2795,8 +3938,290 @@ async fn responses(
             }
             response_with_tenant_permit(Json(response).into_response(), tenant_permit)
         }
-        Err(error) => internal_error_response(error.to_string()),
+        Err(error) => kernel_error_response(error),
     }
+}
+
+async fn create_background_response(
+    state: AppState,
+    request_context: RequestContext,
+    request: OpenAiResponsesRequest,
+    mut persisted_request: serde_json::Value,
+) -> Response {
+    let execution =
+        match prepare_openai_responses_execution(&state.responses, request, &request_context).await
+        {
+            Ok(execution) => execution,
+            Err(error) => return api_error_response(error),
+        };
+    if let Some(object) = persisted_request.as_object_mut() {
+        object.insert("background".to_string(), serde_json::Value::Bool(false));
+        object.insert("stream".to_string(), serde_json::Value::Bool(false));
+        object.insert("store".to_string(), serde_json::Value::Bool(true));
+    }
+    let persisted_bytes = match serde_json::to_vec(&persisted_request) {
+        Ok(bytes) => bytes,
+        Err(error) => return internal_error_response(error.to_string()),
+    };
+    let tenant_id = execution.tenant_id.clone();
+    let response_id = execution.response_id.clone();
+    if let Err(error) = state
+        .durable
+        .put_blob(
+            BACKGROUND_RESPONSE_INPUTS_NAMESPACE,
+            &tenant_id,
+            &response_id,
+            persisted_bytes,
+        )
+        .await
+    {
+        return internal_error_response(error);
+    }
+    let job = BackgroundResponseJob {
+        tenant_id: tenant_id.clone(),
+        response_id: response_id.clone(),
+        created_at: execution.created_at,
+        status: "queued".to_string(),
+        cancel_requested: false,
+        last_error: None,
+    };
+    if let Err(error) = state
+        .durable
+        .put_json(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            &tenant_id,
+            &response_id,
+            &job,
+        )
+        .await
+    {
+        return internal_error_response(error);
+    }
+    let response = openai_response_value_with_status(
+        &execution,
+        &execution.request_model,
+        Vec::new(),
+        String::new(),
+        serde_json::Value::Null,
+        "queued",
+        None,
+    );
+    if let Err(error) = store_openai_response(
+        &state.responses,
+        &execution,
+        &response,
+        execution.conversation_messages.clone(),
+        true,
+    )
+    .await
+    {
+        return internal_error_response(error);
+    }
+    spawn_background_response_job(state, job);
+    Json(response).into_response()
+}
+
+fn spawn_background_response_job(state: AppState, job: BackgroundResponseJob) {
+    let key = background_response_job_key(&job.tenant_id, &job.response_id);
+    let runtime = state.jobs.clone();
+    runtime.spawn(key, move |cancellation| async move {
+        run_background_response_job(state, job, cancellation).await;
+    });
+}
+
+async fn run_background_response_job(
+    state: AppState,
+    mut job: BackgroundResponseJob,
+    cancellation: CancellationToken,
+) {
+    let latest = state
+        .durable
+        .get_json::<BackgroundResponseJob>(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            &job.tenant_id,
+            &job.response_id,
+        )
+        .await;
+    if let Ok(Some(latest)) = latest {
+        job = latest;
+    }
+    if job.cancel_requested || cancellation.is_cancelled() {
+        finish_background_response_cancelled(&state, &mut job).await;
+        return;
+    }
+
+    job.status = "in_progress".to_string();
+    if state
+        .durable
+        .put_json(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            &job.tenant_id,
+            &job.response_id,
+            &job,
+        )
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if update_stored_background_response(&state, &job, "in_progress", None)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let bytes = match state
+        .durable
+        .get_blob(
+            BACKGROUND_RESPONSE_INPUTS_NAMESPACE,
+            &job.tenant_id,
+            &job.response_id,
+        )
+        .await
+    {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            finish_background_response_failed(
+                &state,
+                &mut job,
+                "background request payload is missing".to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            finish_background_response_failed(&state, &mut job, error).await;
+            return;
+        }
+    };
+    let raw_request = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            finish_background_response_failed(&state, &mut job, error.to_string()).await;
+            return;
+        }
+    };
+    let headers = match batch_api::tenant_headers_for_background(&job.tenant_id) {
+        Ok(headers) => headers,
+        Err(error) => {
+            finish_background_response_failed(&state, &mut job, error).await;
+            return;
+        }
+    };
+    let execution = execute_openai_responses_value_with_id(
+        &state,
+        &headers,
+        raw_request,
+        true,
+        Some(job.response_id.clone()),
+    );
+    tokio::pin!(execution);
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => None,
+        result = &mut execution => Some(result),
+    };
+    match result {
+        None => finish_background_response_cancelled(&state, &mut job).await,
+        Some(Ok(_)) => {
+            job.status = "completed".to_string();
+            job.last_error = None;
+            if let Ok(Some(mut stored)) = state.responses.get(&job.tenant_id, &job.response_id) {
+                stored.response["background"] = serde_json::Value::Bool(true);
+                let _ = state.responses.put(stored).await;
+            }
+            let _ = state
+                .durable
+                .put_json(
+                    BACKGROUND_RESPONSES_NAMESPACE,
+                    &job.tenant_id,
+                    &job.response_id,
+                    &job,
+                )
+                .await;
+        }
+        Some(Err(error)) => {
+            finish_background_response_failed(&state, &mut job, error).await;
+        }
+    }
+}
+
+async fn finish_background_response_cancelled(state: &AppState, job: &mut BackgroundResponseJob) {
+    job.status = "cancelled".to_string();
+    job.cancel_requested = true;
+    let _ = update_stored_background_response(state, job, "cancelled", None).await;
+    let _ = state
+        .durable
+        .put_json(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            &job.tenant_id,
+            &job.response_id,
+            job,
+        )
+        .await;
+}
+
+async fn finish_background_response_failed(
+    state: &AppState,
+    job: &mut BackgroundResponseJob,
+    error: String,
+) {
+    job.status = "failed".to_string();
+    job.last_error = Some(error.clone());
+    let _ = update_stored_background_response(state, job, "failed", Some(error)).await;
+    let _ = state
+        .durable
+        .put_json(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            &job.tenant_id,
+            &job.response_id,
+            job,
+        )
+        .await;
+}
+
+async fn update_stored_background_response(
+    state: &AppState,
+    job: &BackgroundResponseJob,
+    status: &str,
+    error: Option<String>,
+) -> Result<(), String> {
+    let Some(mut stored) = state.responses.get(&job.tenant_id, &job.response_id)? else {
+        return Err(format!(
+            "stored background response not found: {}",
+            job.response_id
+        ));
+    };
+    stored.response["status"] = serde_json::Value::String(status.to_string());
+    stored.response["background"] = serde_json::Value::Bool(true);
+    stored.response["error"] = error
+        .map(|message| {
+            serde_json::json!({
+                "code": "background_execution_failed",
+                "message": message
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    state.responses.put(stored).await
+}
+
+async fn recover_background_response_jobs(state: AppState) {
+    let jobs = match state
+        .durable
+        .list_all_json::<BackgroundResponseJob>(BACKGROUND_RESPONSES_NAMESPACE)
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(_) => return,
+    };
+    for job in jobs {
+        if matches!(job.status.as_str(), "queued" | "in_progress") {
+            spawn_background_response_job(state.clone(), job);
+        }
+    }
+}
+
+fn background_response_job_key(tenant_id: &str, response_id: &str) -> String {
+    format!("openai-response:{tenant_id}:{response_id}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -3017,6 +4442,17 @@ async fn execute_openai_responses_value(
     raw_request: serde_json::Value,
     force_store_response: bool,
 ) -> Result<serde_json::Value, String> {
+    execute_openai_responses_value_with_id(state, headers, raw_request, force_store_response, None)
+        .await
+}
+
+async fn execute_openai_responses_value_with_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw_request: serde_json::Value,
+    force_store_response: bool,
+    forced_response_id: Option<String>,
+) -> Result<serde_json::Value, String> {
     let request = parse_openai_responses_request(raw_request).map_err(api_error_message)?;
     let include_public_reasoning = state
         .public_reasoning_mode
@@ -3029,9 +4465,14 @@ async fn execute_openai_responses_value(
         .acquire(&tenant_id)
         .await
         .map_err(|error| error.to_string())?;
-    let execution = prepare_openai_responses_execution(&state.responses, request, &request_context)
-        .await
-        .map_err(api_error_message)?;
+    let execution = prepare_openai_responses_execution_with_id(
+        &state.responses,
+        request,
+        &request_context,
+        forced_response_id,
+    )
+    .await
+    .map_err(api_error_message)?;
 
     if matches!(
         openai_reasoning_effort(&execution.chat_request),
@@ -3208,17 +4649,57 @@ async fn responses_delete(
     Path(response_id): Path<String>,
 ) -> Response {
     let tenant_id = RequestContext::from_headers(&headers).tenant_id();
+    let background_job = match state
+        .durable
+        .get_json::<BackgroundResponseJob>(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            tenant_id.as_ref(),
+            &response_id,
+        )
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => return internal_error_response(error),
+    };
+    if background_job
+        .as_ref()
+        .is_some_and(|job| matches!(job.status.as_str(), "queued" | "in_progress" | "cancelling"))
+    {
+        return conflict_response(
+            "cancel an active background response before deleting it".to_string(),
+        );
+    }
     match state
         .responses
         .delete(tenant_id.as_ref(), &response_id)
         .await
     {
-        Ok(true) => Json(serde_json::json!({
-            "id": response_id,
-            "object": "response.deleted",
-            "deleted": true
-        }))
-        .into_response(),
+        Ok(true) => {
+            if background_job.is_some() {
+                let _ = state
+                    .durable
+                    .delete_json(
+                        BACKGROUND_RESPONSES_NAMESPACE,
+                        tenant_id.as_ref(),
+                        &response_id,
+                    )
+                    .await;
+                let _ = state
+                    .durable
+                    .delete_blob(
+                        BACKGROUND_RESPONSE_INPUTS_NAMESPACE,
+                        tenant_id.as_ref(),
+                        &response_id,
+                    )
+                    .await;
+            }
+            Json(serde_json::json!({
+                "id": response_id,
+                "object": "response.deleted",
+                "deleted": true
+            }))
+            .into_response()
+        }
         Ok(false) => not_found_response(format!("response not found: {response_id}")),
         Err(error) => internal_error_response(error),
     }
@@ -3248,14 +4729,69 @@ async fn responses_cancel(
     Path(response_id): Path<String>,
 ) -> Response {
     let tenant_id = RequestContext::from_headers(&headers).tenant_id();
-    match state.responses.get(tenant_id.as_ref(), &response_id) {
-        Ok(Some(mut stored)) => {
-            stored.response["status"] = serde_json::Value::String("cancelled".to_string());
-            if let Err(error) = state.responses.put(stored.clone()).await {
-                return internal_error_response(error);
-            }
-            Json(stored.response).into_response()
+    let mut job = match state
+        .durable
+        .get_json::<BackgroundResponseJob>(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            tenant_id.as_ref(),
+            &response_id,
+        )
+        .await
+    {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return match state.responses.get(tenant_id.as_ref(), &response_id) {
+                Ok(Some(_)) => api_error_response(ApiError::InvalidRequest(
+                    "only Responses created with background=true can be cancelled".to_string(),
+                )),
+                Ok(None) => not_found_response(format!("response not found: {response_id}")),
+                Err(error) => internal_error_response(error),
+            };
         }
+        Err(error) => return internal_error_response(error),
+    };
+    if matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
+        return api_error_response(ApiError::InvalidRequest(format!(
+            "background response {response_id} is already {}",
+            job.status
+        )));
+    }
+    job.cancel_requested = true;
+    job.status = "cancelling".to_string();
+    if let Err(error) = state
+        .durable
+        .put_json(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            tenant_id.as_ref(),
+            &response_id,
+            &job,
+        )
+        .await
+    {
+        return internal_error_response(error);
+    }
+    state.jobs.cancel(&background_response_job_key(
+        tenant_id.as_ref(),
+        &response_id,
+    ));
+    job.status = "cancelled".to_string();
+    if let Err(error) = update_stored_background_response(&state, &job, "cancelled", None).await {
+        return internal_error_response(error);
+    }
+    if let Err(error) = state
+        .durable
+        .put_json(
+            BACKGROUND_RESPONSES_NAMESPACE,
+            tenant_id.as_ref(),
+            &response_id,
+            &job,
+        )
+        .await
+    {
+        return internal_error_response(error);
+    }
+    match state.responses.get(tenant_id.as_ref(), &response_id) {
+        Ok(Some(stored)) => Json(stored.response).into_response(),
         Ok(None) => not_found_response(format!("response not found: {response_id}")),
         Err(error) => internal_error_response(error),
     }
@@ -3301,42 +4837,56 @@ async fn responses_compact(Json(raw): Json<serde_json::Value>) -> Response {
     .into_response()
 }
 
-async fn chat_completions_batch(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(batch): Json<OpenAiChatBatchRequest>,
-) -> Response {
-    if let Err(error) = validate_batch_len(batch.requests.len()) {
+async fn messages_count_tokens(Json(raw_request): Json<serde_json::Value>) -> Response {
+    if let Err(error) = parse_anthropic_request(raw_request.clone()) {
         return api_error_response(error);
     }
 
-    let deps = BatchRequestDeps {
-        kernel: state.kernel.clone(),
-        context: state.context.clone(),
-        direct: state.direct.clone(),
-        tenant_limiter: state.tenant_limiter.clone(),
-        training_trace: state.training_trace.clone(),
-        public_reasoning_mode: state.public_reasoning_mode,
-    };
-    let request_context = RequestContext::from_headers(&headers);
-    let data = join_all(
-        batch
-            .requests
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| {
-                let deps = deps.clone();
-                let request_context = request_context.clone();
-                async move { run_openai_batch_item(deps, request_context, index, request).await }
-            }),
+    let system_text = response_input_text_for_compaction(
+        raw_request
+            .get("system")
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    let message_text = response_input_text_for_compaction(
+        raw_request
+            .get("messages")
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    let tool_text = raw_request
+        .get("tools")
+        .filter(|tools| !tools.is_null())
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    let image_tokens = count_json_blocks_of_type(
+        raw_request
+            .get("messages")
+            .unwrap_or(&serde_json::Value::Null),
+        "image",
     )
-    .await;
+    .saturating_mul(256);
+    let input_tokens = estimate_text_tokens(&system_text)
+        .saturating_add(estimate_text_tokens(&message_text))
+        .saturating_add(estimate_text_tokens(&tool_text))
+        .saturating_add(image_tokens);
 
-    Json(serde_json::json!({
-        "object": "chat.completion.batch",
-        "data": data
-    }))
-    .into_response()
+    Json(serde_json::json!({"input_tokens": input_tokens})).into_response()
+}
+
+fn count_json_blocks_of_type(value: &serde_json::Value, expected_type: &str) -> u32 {
+    match value {
+        serde_json::Value::Array(values) => values.iter().fold(0_u32, |count, value| {
+            count.saturating_add(count_json_blocks_of_type(value, expected_type))
+        }),
+        serde_json::Value::Object(object) => {
+            let own = u32::from(
+                object.get("type").and_then(serde_json::Value::as_str) == Some(expected_type),
+            );
+            object.values().fold(own, |count, value| {
+                count.saturating_add(count_json_blocks_of_type(value, expected_type))
+            })
+        }
+        _ => 0,
+    }
 }
 
 async fn messages(
@@ -3375,7 +4925,7 @@ async fn messages(
                 .await
             {
                 Ok(response) => response_with_tenant_permit(response, tenant_permit),
-                Err(error) => internal_error_response(error),
+                Err(error) => provider_error_response(error),
             };
         }
         return match state.direct.anthropic_messages(provider_raw_request).await {
@@ -3397,7 +4947,7 @@ async fn messages(
                 }
                 Json(value).into_response()
             }
-            Err(error) => internal_error_response(error),
+            Err(error) => provider_error_response(error),
         };
     }
 
@@ -3427,7 +4977,7 @@ async fn messages(
                 ),
                 tenant_permit,
             ),
-            Err(error) => internal_error_response(error.to_string()),
+            Err(error) => kernel_error_response(error),
         };
     }
 
@@ -3457,304 +5007,8 @@ async fn messages(
             attach_context_report(&mut response, prepared_context.as_ref(), context_report);
             Json(response).into_response()
         }
-        Err(error) => internal_error_response(error.to_string()),
+        Err(error) => kernel_error_response(error),
     }
-}
-
-async fn messages_batch(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(batch): Json<AnthropicMessagesBatchRequest>,
-) -> Response {
-    if let Err(error) = validate_batch_len(batch.requests.len()) {
-        return api_error_response(error);
-    }
-
-    let deps = BatchRequestDeps {
-        kernel: state.kernel.clone(),
-        context: state.context.clone(),
-        direct: state.direct.clone(),
-        tenant_limiter: state.tenant_limiter.clone(),
-        training_trace: state.training_trace.clone(),
-        public_reasoning_mode: state.public_reasoning_mode,
-    };
-    let request_context = RequestContext::from_headers(&headers);
-    let data = join_all(
-        batch
-            .requests
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| {
-                let deps = deps.clone();
-                let request_context = request_context.clone();
-                async move { run_anthropic_batch_item(deps, request_context, index, request).await }
-            }),
-    )
-    .await;
-
-    Json(serde_json::json!({
-        "type": "message_batch",
-        "data": data
-    }))
-    .into_response()
-}
-
-#[derive(Clone)]
-struct BatchRequestDeps {
-    kernel: Arc<KernelRunner<Arc<dyn ModelProvider>>>,
-    context: ApiContextManager,
-    direct: DirectBackend,
-    tenant_limiter: TenantConcurrencyLimiter,
-    training_trace: TrainingTraceRecorder,
-    public_reasoning_mode: PublicReasoningMode,
-}
-
-async fn run_openai_batch_item(
-    deps: BatchRequestDeps,
-    request_context: RequestContext,
-    index: usize,
-    raw_request: serde_json::Value,
-) -> serde_json::Value {
-    let request = match parse_openai_request(raw_request.clone()) {
-        Ok(request) => request,
-        Err(error) => return batch_api_error(index, error),
-    };
-    if request.stream {
-        return batch_api_error(index, ApiError::StreamUnsupported);
-    }
-    let include_public_reasoning = deps
-        .public_reasoning_mode
-        .resolve(openai_public_reasoning_requested(&request));
-    let request_context = request_context.with_metadata_overrides(&request.metadata);
-    let tenant_id = request_context.tenant_id();
-    let _tenant_permit = match deps.tenant_limiter.acquire(&tenant_id).await {
-        Ok(permit) => permit,
-        Err(error) => return batch_kernel_error(index, error),
-    };
-    let direct_training_request = deps
-        .training_trace
-        .capture_openai_request(&request, &request_context);
-    if matches!(openai_reasoning_effort(&request), Ok(ReasoningEffort::None)) {
-        let provider_raw_request = raw_request_with_provider_model(raw_request, &request.model);
-        return match deps.direct.openai_chat(provider_raw_request).await {
-            Ok(response) => {
-                let telemetry_context = direct_telemetry_context(
-                    "openai.chat_completions.batch_item",
-                    request.model.clone(),
-                    "openai_chat",
-                    &request_context,
-                    false,
-                    Some(index),
-                );
-                emit_direct_telemetry(&telemetry_context, response_usage(&response));
-                if let Err(error) = deps.training_trace.record_direct(
-                    direct_training_request.as_ref(),
-                    openai_response_text(&response),
-                ) {
-                    log_training_trace_error(error);
-                }
-                batch_success(index, response)
-            }
-            Err(error) => batch_kernel_error(index, error),
-        };
-    }
-
-    let model = request.model.clone();
-    let tool_response_format = openai_tool_response_format(&request);
-    let mut normalized = match normalize_openai_chat_with_context(request, &request_context) {
-        Ok(normalized) => normalized,
-        Err(error) => return batch_api_error(index, error),
-    };
-    normalized.public_reasoning_enabled = include_public_reasoning;
-    let prepared_context = match deps.context.prepare(&mut normalized).await {
-        Ok(prepared) => prepared,
-        Err(error) => return batch_kernel_error(index, error),
-    };
-    let include_encrypted_state = include_encrypted_subagent_state(&normalized.metadata);
-    let telemetry_context = telemetry_context_from_normalized(
-        "openai.chat_completions.batch_item",
-        &normalized,
-        false,
-        Some(index),
-    );
-    let training_request = deps.training_trace.capture_request(&normalized);
-    let response_tool_names = normalized_tool_names(&normalized.tools);
-
-    match deps.kernel.run(normalized).await {
-        Ok(output) => {
-            match finalize_context_report(&deps.context, &prepared_context, &output).await {
-                Ok(context_report) => {
-                    emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
-                    if let Err(error) = deps
-                        .training_trace
-                        .record_kernel(training_request.as_ref(), &output)
-                    {
-                        log_training_trace_error(error);
-                    }
-                    let mut response = format_openai_response(
-                        model,
-                        output,
-                        &response_tool_names,
-                        include_encrypted_state,
-                        tool_response_format,
-                        include_public_reasoning,
-                    );
-                    attach_context_report(&mut response, prepared_context.as_ref(), context_report);
-                    batch_success(index, response)
-                }
-                Err(error) => batch_kernel_error(index, error),
-            }
-        }
-        Err(error) => batch_kernel_error(index, error.to_string()),
-    }
-}
-
-async fn run_anthropic_batch_item(
-    deps: BatchRequestDeps,
-    request_context: RequestContext,
-    index: usize,
-    raw_request: serde_json::Value,
-) -> serde_json::Value {
-    let request = match parse_anthropic_request(raw_request.clone()) {
-        Ok(request) => request,
-        Err(error) => return batch_api_error(index, error),
-    };
-    if request.stream {
-        return batch_api_error(index, ApiError::StreamUnsupported);
-    }
-    let include_public_reasoning = deps
-        .public_reasoning_mode
-        .resolve(anthropic_public_reasoning_requested(&request));
-    let request_context = request_context.with_metadata_overrides(&request.metadata);
-    let tenant_id = request_context.tenant_id();
-    let _tenant_permit = match deps.tenant_limiter.acquire(&tenant_id).await {
-        Ok(permit) => permit,
-        Err(error) => return batch_kernel_error(index, error),
-    };
-    let direct_training_request = deps
-        .training_trace
-        .capture_anthropic_request(&request, &request_context);
-    if matches!(
-        anthropic_reasoning_effort(&request),
-        Ok(ReasoningEffort::None)
-    ) {
-        let provider_raw_request = raw_request_with_provider_model(raw_request, &request.model);
-        return match deps.direct.anthropic_messages(provider_raw_request).await {
-            Ok(response) => {
-                let telemetry_context = direct_telemetry_context(
-                    "anthropic.messages.batch_item",
-                    request.model.clone(),
-                    "anthropic_messages",
-                    &request_context,
-                    false,
-                    Some(index),
-                );
-                emit_direct_telemetry(&telemetry_context, response_usage(&response));
-                if let Err(error) = deps.training_trace.record_direct(
-                    direct_training_request.as_ref(),
-                    anthropic_response_text(&response),
-                ) {
-                    log_training_trace_error(error);
-                }
-                batch_success(index, response)
-            }
-            Err(error) => batch_kernel_error(index, error),
-        };
-    }
-
-    let model = request.model.clone();
-    let mut normalized = match normalize_anthropic_messages_with_context(request, &request_context)
-    {
-        Ok(normalized) => normalized,
-        Err(error) => return batch_api_error(index, error),
-    };
-    normalized.public_reasoning_enabled = include_public_reasoning;
-    let prepared_context = match deps.context.prepare(&mut normalized).await {
-        Ok(prepared) => prepared,
-        Err(error) => return batch_kernel_error(index, error),
-    };
-    let include_encrypted_state = include_encrypted_subagent_state(&normalized.metadata);
-    let telemetry_context = telemetry_context_from_normalized(
-        "anthropic.messages.batch_item",
-        &normalized,
-        false,
-        Some(index),
-    );
-    let training_request = deps.training_trace.capture_request(&normalized);
-
-    match deps.kernel.run(normalized).await {
-        Ok(output) => {
-            match finalize_context_report(&deps.context, &prepared_context, &output).await {
-                Ok(context_report) => {
-                    emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
-                    if let Err(error) = deps
-                        .training_trace
-                        .record_kernel(training_request.as_ref(), &output)
-                    {
-                        log_training_trace_error(error);
-                    }
-                    let mut response = format_anthropic_response(
-                        model,
-                        output,
-                        include_encrypted_state,
-                        include_public_reasoning,
-                    );
-                    attach_context_report(&mut response, prepared_context.as_ref(), context_report);
-                    batch_success(index, response)
-                }
-                Err(error) => batch_kernel_error(index, error),
-            }
-        }
-        Err(error) => batch_kernel_error(index, error.to_string()),
-    }
-}
-
-fn validate_batch_len(len: usize) -> Result<(), ApiError> {
-    if len == 0 {
-        return Err(ApiError::InvalidRequest(
-            "batch requests must contain at least one request".to_string(),
-        ));
-    }
-    if len > MAX_BATCH_REQUESTS {
-        return Err(ApiError::InvalidRequest(format!(
-            "batch requests must not exceed {MAX_BATCH_REQUESTS} items"
-        )));
-    }
-    Ok(())
-}
-
-fn batch_success(index: usize, response: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "index": index,
-        "response": response,
-        "error": null
-    })
-}
-
-fn batch_api_error(index: usize, error: ApiError) -> serde_json::Value {
-    let (_, code, message) = api_error_parts(error);
-    batch_error(index, code, "invalid_request_error", message)
-}
-
-fn batch_kernel_error(index: usize, message: String) -> serde_json::Value {
-    batch_error(index, "kernel_error", "server_error", message)
-}
-
-fn batch_error(
-    index: usize,
-    code: &'static str,
-    error_type: &'static str,
-    message: String,
-) -> serde_json::Value {
-    serde_json::json!({
-        "index": index,
-        "response": null,
-        "error": {
-            "message": message,
-            "type": error_type,
-            "code": code
-        }
-    })
 }
 
 async fn finalize_context_report(
@@ -3823,6 +5077,10 @@ fn message_text(message: &NormalizedMessage) -> String {
         .map(|part| match part {
             NormalizedContentPart::Text { text } => text.as_str(),
             NormalizedContentPart::Image { .. } => "[image]",
+            NormalizedContentPart::ProviderContent { value, .. } => value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("[provider_content]"),
             NormalizedContentPart::ToolCall { .. } => "[tool_call]",
             NormalizedContentPart::ToolResult { .. } => "[tool_result]",
         })
@@ -4130,6 +5388,100 @@ fn api_error_parts(error: ApiError) -> (StatusCode, &'static str, String) {
     (status, code, message)
 }
 
+fn kernel_error_response(error: KernelError) -> Response {
+    if let KernelError::Provider(provider_error) = error {
+        return provider_error_response(provider_error);
+    }
+    let (status, code, error_type) = match &error {
+        KernelError::RequestTimeout { .. } | KernelError::AgentTimeout { .. } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "request_timeout",
+            "timeout_error",
+        ),
+        KernelError::ProviderRejected(message)
+            if message.contains("provider queue wait exceeded") =>
+        {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider_overloaded",
+                "server_error",
+            )
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "kernel_error",
+            "server_error",
+        ),
+    };
+    (
+        status,
+        Json(CompatibilityError {
+            error: CompatibilityErrorBody {
+                message: error.to_string(),
+                r#type: error_type.to_string(),
+                code: code.to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn provider_error_response(error: ProviderError) -> Response {
+    let (status, code, error_type) = match &error {
+        ProviderError::Http { status, code, .. } => {
+            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let error_type = if status == StatusCode::TOO_MANY_REQUESTS {
+                "rate_limit_error"
+            } else if status.is_client_error() {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            };
+            (
+                status,
+                code.clone().unwrap_or_else(|| "upstream_error".to_string()),
+                error_type,
+            )
+        }
+        ProviderError::CircuitOpen { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_circuit_open".to_string(),
+            "server_error",
+        ),
+        ProviderError::QueueTimeout { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_overloaded".to_string(),
+            "server_error",
+        ),
+        ProviderError::Transport { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "provider_transport_error".to_string(),
+            "server_error",
+        ),
+        ProviderError::InvalidResponse { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "invalid_provider_response".to_string(),
+            "server_error",
+        ),
+        ProviderError::Rejected(_) => (
+            StatusCode::BAD_GATEWAY,
+            "provider_rejected".to_string(),
+            "server_error",
+        ),
+    };
+    (
+        status,
+        Json(CompatibilityError {
+            error: CompatibilityErrorBody {
+                message: error.to_string(),
+                r#type: error_type.to_string(),
+                code,
+            },
+        }),
+    )
+        .into_response()
+}
+
 fn internal_error_response(message: String) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -4138,6 +5490,20 @@ fn internal_error_response(message: String) -> Response {
                 message,
                 r#type: "server_error".to_string(),
                 code: "kernel_error".to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn conflict_response(message: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(CompatibilityError {
+            error: CompatibilityErrorBody {
+                message,
+                r#type: "conflict_error".to_string(),
+                code: "conflict".to_string(),
             },
         }),
     )
@@ -4160,6 +5526,14 @@ fn not_found_response(message: String) -> Response {
 
 fn log_training_trace_error(error: String) {
     eprintln!("training trace error: {error}");
+}
+
+fn response_with_provider_permit(
+    mut response: Response,
+    permit: ProviderAdmissionPermit,
+) -> Response {
+    response.extensions_mut().insert(Arc::new(permit));
+    response
 }
 
 fn response_with_tenant_permit(
@@ -4446,7 +5820,13 @@ fn public_reasoning_summary(output: &KernelOutput) -> String {
     let verification = &output.verification;
     lines.push(format!(
         "- Verification {} with {} issue(s), {} unresolved tool call(s), {} provider call(s), and {} orchestration tokens recorded against accounting reference {}.",
-        if verification.passed { "passed" } else { "requires client tool action" },
+        if verification.passed {
+            "passed"
+        } else if verification.unresolved_tool_calls.is_empty() {
+            "completed with semantic verification issues"
+        } else {
+            "requires client tool action"
+        },
         verification.issues.len(),
         verification.unresolved_tool_calls.len(),
         output.provider_call_count,
@@ -4887,7 +6267,9 @@ fn format_openai_response(
                 "usage": usage
             })
         }
-    } else if output.verification.passed {
+    } else if output.verification.unresolved_tool_calls.is_empty()
+        && !output.final_text.trim().is_empty()
+    {
         serde_json::json!({
             "id": format!("chatcmpl-{}", Uuid::new_v4()),
             "object": "chat.completion",
@@ -4985,6 +6367,7 @@ struct OpenAiResponsesExecution {
     request_model: String,
     previous_response_id: Option<String>,
     store: bool,
+    background: bool,
     metadata: serde_json::Value,
     tools: Vec<serde_json::Value>,
     tool_choice: serde_json::Value,
@@ -5001,6 +6384,16 @@ async fn prepare_openai_responses_execution(
     request: OpenAiResponsesRequest,
     request_context: &RequestContext,
 ) -> Result<OpenAiResponsesExecution, ApiError> {
+    prepare_openai_responses_execution_with_id(store, request, request_context, None).await
+}
+
+async fn prepare_openai_responses_execution_with_id(
+    store: &ResponsesStore,
+    request: OpenAiResponsesRequest,
+    request_context: &RequestContext,
+    forced_response_id: Option<String>,
+) -> Result<OpenAiResponsesExecution, ApiError> {
+    validate_openai_responses_request(&request)?;
     let tenant_id = request_context.tenant_id();
     let previous_messages = if let Some(previous_response_id) = &request.previous_response_id {
         let stored = store
@@ -5054,12 +6447,13 @@ async fn prepare_openai_responses_execution(
     };
 
     Ok(OpenAiResponsesExecution {
-        response_id: format!("resp_{}", Uuid::new_v4()),
+        response_id: forced_response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4())),
         created_at: unix_timestamp_secs(),
         tenant_id: tenant_id.as_ref().to_string(),
         request_model: request.model,
         previous_response_id: request.previous_response_id,
         store: request.store.unwrap_or(true),
+        background: request.background,
         metadata: request.metadata,
         tools: request.tools,
         tool_choice: request.tool_choice,
@@ -5070,6 +6464,35 @@ async fn prepare_openai_responses_execution(
         conversation_messages,
         chat_request,
     })
+}
+
+fn validate_openai_responses_request(request: &OpenAiResponsesRequest) -> Result<(), ApiError> {
+    if request.background && request.stream {
+        return Err(ApiError::InvalidRequest(
+            "background Responses cannot use stream=true; poll the stored response instead"
+                .to_string(),
+        ));
+    }
+    for field in ["conversation", "prompt"] {
+        if request
+            .extra
+            .get(field)
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(ApiError::InvalidRequest(format!(
+                "Responses field {field} is not implemented by this gateway"
+            )));
+        }
+    }
+    if let Some(truncation) = request.extra.get("truncation")
+        && !truncation.is_null()
+        && truncation.as_str() != Some("disabled")
+    {
+        return Err(ApiError::InvalidRequest(
+            "only truncation=disabled is currently supported".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn responses_provider_options(
@@ -5099,6 +6522,14 @@ fn responses_provider_options(
     if let Some(response_format) = responses_text_to_chat_response_format(&request.extra) {
         extra.insert("response_format".to_string(), response_format);
     }
+    if let Some(verbosity) = request
+        .extra
+        .get("text")
+        .and_then(|text| text.get("verbosity"))
+        .filter(|verbosity| !verbosity.is_null())
+    {
+        extra.insert("verbosity".to_string(), verbosity.clone());
+    }
     extra
 }
 
@@ -5114,10 +6545,6 @@ fn is_responses_only_option(key: &str) -> bool {
             | "max_tool_calls"
             | "previous_response_id"
             | "prompt"
-            | "prompt_cache_key"
-            | "prompt_cache_retention"
-            | "safety_identifier"
-            | "service_tier"
             | "store"
             | "stream_options"
             | "text"
@@ -5218,6 +6645,16 @@ fn response_input_item_to_messages(
         .and_then(|value| value.as_str())
         .unwrap_or("message");
     match item_type {
+        "input_audio" | "input_file" | "input_image" | "input_text" => Ok(vec![OpenAiMessage {
+            role: "user".to_string(),
+            content: response_message_content_to_openai_content(Some(&serde_json::Value::Array(
+                vec![item.clone()],
+            ))),
+            tool_calls: Vec::new(),
+            function_call: None,
+            tool_call_id: None,
+            name: None,
+        }]),
         "message" => {
             let role = object
                 .get("role")
@@ -5300,6 +6737,38 @@ fn response_message_content_to_openai_content(
                 if let Some(url) = url {
                     openai_parts.push(OpenAiContentPart::ImageUrl {
                         image_url: OpenAiImageUrl { url },
+                    });
+                }
+            }
+            "input_audio" => {
+                if let Some(input_audio) = part.get("input_audio") {
+                    openai_parts.push(OpenAiContentPart::InputAudio {
+                        input_audio: input_audio.clone(),
+                        extra: BTreeMap::new(),
+                    });
+                }
+            }
+            "input_file" | "file" => {
+                let file = if let Some(file) = part.get("file") {
+                    file.clone()
+                } else {
+                    let mut file = serde_json::Map::new();
+                    for key in ["file_data", "file_id", "file_url", "filename", "detail"] {
+                        if let Some(value) = part.get(key) {
+                            file.insert(key.to_string(), value.clone());
+                        }
+                    }
+                    serde_json::Value::Object(file)
+                };
+                openai_parts.push(OpenAiContentPart::File {
+                    file,
+                    extra: BTreeMap::new(),
+                });
+            }
+            "refusal" => {
+                if let Some(refusal) = part.get("refusal").and_then(serde_json::Value::as_str) {
+                    openai_parts.push(OpenAiContentPart::Refusal {
+                        refusal: refusal.to_string(),
                     });
                 }
             }
@@ -5556,7 +7025,10 @@ fn format_openai_responses_response(
     let reasoning_summary = include_public_reasoning.then(|| public_reasoning_summary(&output));
     let final_text_tool_call = response_text_tool_call_record(execution, &output);
     let output_items = openai_responses_output_items(execution, &output, reasoning_summary);
-    let output_text = if output.verification.passed && final_text_tool_call.is_none() {
+    let output_text = if output.verification.unresolved_tool_calls.is_empty()
+        && !output.final_text.trim().is_empty()
+        && final_text_tool_call.is_none()
+    {
         output.final_text.clone()
     } else {
         String::new()
@@ -5604,7 +7076,9 @@ fn openai_responses_output_items(
 
     if let Some(call) = response_text_tool_call_record(execution, output) {
         items.push(openai_response_tool_call_item(execution, &call));
-    } else if output.verification.passed {
+    } else if output.verification.unresolved_tool_calls.is_empty()
+        && !output.final_text.trim().is_empty()
+    {
         items.push(openai_response_message_item(
             &format!("msg_{}", Uuid::new_v4()),
             &output.final_text,
@@ -5655,6 +7129,7 @@ fn openai_response_value_with_status(
         "object": "response",
         "created_at": execution.created_at,
         "status": status,
+        "background": execution.background,
         "error": null,
         "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({"reason": reason})).unwrap_or(serde_json::Value::Null),
         "instructions": if execution.instructions.is_null() { serde_json::Value::Null } else { execution.instructions.clone() },
@@ -5853,7 +7328,9 @@ fn response_conversation_messages_from_kernel_output(
             tool_call_id: None,
             name: None,
         });
-    } else if output.verification.passed {
+    } else if output.verification.unresolved_tool_calls.is_empty()
+        && !output.final_text.trim().is_empty()
+    {
         messages.push(openai_text_message("assistant", output.final_text.clone()));
     } else if !output.tool_calls.is_empty() {
         messages.push(OpenAiMessage {
@@ -6938,7 +8415,9 @@ fn format_openai_stream_response(
             )));
             body.push_str(&openai_stream_finish_chunk(&id, &model, "tool_calls"));
         }
-    } else if output.verification.passed {
+    } else if output.verification.unresolved_tool_calls.is_empty()
+        && !output.final_text.trim().is_empty()
+    {
         if let Some(summary) = reasoning_summary {
             body.push_str(&sse_data(openai_stream_chunk(
                 &id,
@@ -7646,7 +9125,9 @@ fn format_anthropic_response(
             "signature": ""
         }));
     }
-    let stop_reason = if output.verification.passed {
+    let stop_reason = if output.verification.unresolved_tool_calls.is_empty()
+        && !output.final_text.trim().is_empty()
+    {
         content.push(serde_json::json!({
             "type": "text",
             "text": output.final_text
@@ -7699,7 +9180,8 @@ fn format_anthropic_stream_response(
         index += 1;
     }
 
-    if output.verification.passed {
+    if output.verification.unresolved_tool_calls.is_empty() && !output.final_text.trim().is_empty()
+    {
         body.push_str(&sse_event(
             "content_block_start",
             serde_json::json!({
@@ -8275,6 +9757,29 @@ fn normalize_openai_chat_with_context(
                             media_artifacts.push(artifact);
                             content.push(NormalizedContentPart::Image { artifact_ref });
                         }
+                        OpenAiContentPart::InputAudio { input_audio, extra } => {
+                            content.push(NormalizedContentPart::ProviderContent {
+                                source_format: SourceFormat::OpenAIChat,
+                                value: tagged_provider_content(
+                                    "input_audio",
+                                    "input_audio",
+                                    input_audio,
+                                    extra,
+                                ),
+                            });
+                        }
+                        OpenAiContentPart::File { file, extra } => {
+                            content.push(NormalizedContentPart::ProviderContent {
+                                source_format: SourceFormat::OpenAIChat,
+                                value: tagged_provider_content("file", "file", file, extra),
+                            });
+                        }
+                        OpenAiContentPart::Refusal { refusal } => {
+                            content.push(NormalizedContentPart::ProviderContent {
+                                source_format: SourceFormat::OpenAIChat,
+                                value: serde_json::json!({"type": "refusal", "refusal": refusal}),
+                            });
+                        }
                     }
                 }
             }
@@ -8413,6 +9918,12 @@ fn normalize_anthropic_messages_with_context(
                             });
                             content.push(NormalizedContentPart::ToolResult {
                                 tool_call_id: ToolCallId::from(tool_use_id),
+                            });
+                        }
+                        AnthropicContentBlock::ProviderContent { value } => {
+                            content.push(NormalizedContentPart::ProviderContent {
+                                source_format: SourceFormat::AnthropicMessages,
+                                value,
                             });
                         }
                     }
@@ -9039,7 +10550,7 @@ impl AnthropicMessagesRequest {
 
 fn normalize_role(role: &str) -> MessageRole {
     match role {
-        "system" => MessageRole::System,
+        "system" | "developer" => MessageRole::System,
         "assistant" => MessageRole::Assistant,
         "tool" => MessageRole::Tool,
         _ => MessageRole::User,
@@ -9078,9 +10589,31 @@ fn anthropic_system_to_parts(
                 }
                 AnthropicContentBlock::ToolUse { .. } => None,
                 AnthropicContentBlock::ToolResult { .. } => None,
+                AnthropicContentBlock::ProviderContent { value } => {
+                    Some(NormalizedContentPart::ProviderContent {
+                        source_format: SourceFormat::AnthropicMessages,
+                        value,
+                    })
+                }
             })
             .collect(),
     }
+}
+
+fn tagged_provider_content(
+    kind: &str,
+    field: &str,
+    payload: serde_json::Value,
+    extra: BTreeMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "type".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    object.insert(field.to_string(), payload);
+    object.extend(extra);
+    serde_json::Value::Object(object)
 }
 
 fn openai_tool_arguments(arguments: serde_json::Value) -> serde_json::Value {
@@ -9211,10 +10744,35 @@ fn estimate_text_tokens(text: &str) -> u32 {
     if text.trim().is_empty() {
         return 0;
     }
-    text.split_whitespace()
-        .count()
-        .max(1)
-        .min(u32::MAX as usize) as u32
+
+    let mut tokens = 0_u64;
+    let mut ascii_run = 0_u64;
+    let flush_ascii_run = |tokens: &mut u64, ascii_run: &mut u64| {
+        if *ascii_run > 0 {
+            *tokens = tokens.saturating_add(ascii_run.saturating_add(3) / 4);
+            *ascii_run = 0;
+        }
+    };
+
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            ascii_run = ascii_run.saturating_add(1);
+            continue;
+        }
+
+        flush_ascii_run(&mut tokens, &mut ascii_run);
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch.is_ascii() {
+            tokens = tokens.saturating_add(1);
+        } else {
+            tokens = tokens.saturating_add((ch.len_utf8() as u64).saturating_add(2) / 3);
+        }
+    }
+    flush_ascii_run(&mut tokens, &mut ascii_run);
+
+    tokens.max(1).min(u64::from(u32::MAX)) as u32
 }
 
 pub fn crate_ready() -> bool {
@@ -9225,6 +10783,14 @@ pub fn crate_ready() -> bool {
 mod tests {
     use super::*;
     use agent_protocol::{MediaSource, NormalizedContentPart, SourceFormat};
+
+    #[test]
+    fn local_token_estimate_handles_cjk_and_long_unspaced_text() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert!(estimate_text_tokens("這是一段沒有空格的中文內容") >= 12);
+        assert_eq!(estimate_text_tokens("abcdefgh"), 2);
+        assert!(estimate_text_tokens("hello, world!") >= 4);
+    }
 
     #[test]
     fn normalization_openai_text_and_image_url() {
@@ -9252,6 +10818,49 @@ mod tests {
             normalized.messages[0].content[1],
             NormalizedContentPart::Image { .. }
         ));
+    }
+
+    #[test]
+    fn normalization_openai_preserves_audio_and_file_content_blocks() {
+        let request: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "mock",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                    {"type": "file", "file": {"file_id": "file-123", "filename": "facts.pdf"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let normalized = normalize_openai_chat(request).unwrap();
+        assert!(matches!(
+            &normalized.messages[0].content[0],
+            NormalizedContentPart::ProviderContent { source_format: SourceFormat::OpenAIChat, value }
+                if value["type"] == "input_audio"
+        ));
+        assert!(matches!(
+            &normalized.messages[0].content[1],
+            NormalizedContentPart::ProviderContent { source_format: SourceFormat::OpenAIChat, value }
+                if value["file"]["file_id"] == "file-123"
+        ));
+    }
+
+    #[test]
+    fn normalization_openai_developer_role_preserves_instruction_priority() {
+        let request: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "mock",
+            "messages": [
+                {"role": "developer", "content": "Return JSON only."},
+                {"role": "user", "content": "Give me an answer."}
+            ]
+        }))
+        .unwrap();
+
+        let normalized = normalize_openai_chat(request).unwrap();
+
+        assert_eq!(normalized.messages[0].role, MessageRole::System);
+        assert_eq!(normalized.messages[1].role, MessageRole::User);
     }
 
     #[test]
@@ -9470,6 +11079,36 @@ mod tests {
             normalized.media_artifacts[0].source,
             MediaSource::RemoteUrl { .. }
         ));
+    }
+
+    #[test]
+    fn normalization_anthropic_preserves_document_citation_and_server_tool_blocks() {
+        let request: AnthropicMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "mock",
+            "max_tokens": 256,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "facts"}, "title": "facts"},
+                    {"type": "text", "text": "cited text", "citations": [{"type": "char_location", "cited_text": "cited", "document_index": 0, "document_title": "facts", "start_char_index": 0, "end_char_index": 5}]},
+                    {"type": "server_tool_use", "id": "srv-1", "name": "web_search", "input": {"query": "facts"}}
+                ]
+            }]
+        }))
+        .unwrap();
+        let normalized = normalize_anthropic_messages(request).unwrap();
+        let values = normalized.messages[0]
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                NormalizedContentPart::ProviderContent { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0]["type"], "document");
+        assert!(values[1]["citations"].is_array());
+        assert_eq!(values[2]["type"], "server_tool_use");
     }
 
     #[test]
@@ -10350,6 +11989,181 @@ mod tests {
             .filter_map(|model| model["id"].as_str())
             .collect::<Vec<_>>();
         assert!(ids.contains(&"mock"));
+        assert_eq!(value["has_more"], false);
+        assert_eq!(value["data"][0]["type"], "model");
+        assert_eq!(value["data"][0]["display_name"], "mock");
+        assert_eq!(value["data"][0]["created_at"], "1970-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn routes_models_retrieve_supports_current_sdk_shape() {
+        let found = tower::ServiceExt::oneshot(
+            build_router(),
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/models/mock")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.status(), axum::http::StatusCode::OK);
+        let value = response_json(found).await;
+        assert_eq!(value["id"], "mock");
+        assert_eq!(value["object"], "model");
+        assert_eq!(value["type"], "model");
+
+        let missing = tower::ServiceExt::oneshot(
+            build_router(),
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/models/missing-model")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn routes_anthropic_count_tokens_supports_current_sdk_shape() {
+        let response = tower::ServiceExt::oneshot(
+            build_router(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "system": "請使用繁體中文回答。",
+                        "messages": [{
+                            "role": "user",
+                            "content": [{"type": "text", "text": "這是一段沒有空格的中文內容"}]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let value = response_json(response).await;
+        assert!(value["input_tokens"].as_u64().unwrap() > 10);
+    }
+
+    #[tokio::test]
+    async fn shared_api_key_accepts_openai_and_anthropic_sdk_headers() {
+        let state = AppState {
+            shared_api_key: Some(Arc::<str>::from("deployment-shared-key")),
+            ..AppState::default()
+        };
+        let app = build_router_with_state(state);
+
+        let missing = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers()[axum::http::header::WWW_AUTHENTICATE],
+            "Bearer"
+        );
+
+        let bearer = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .header("authorization", "Bearer deployment-shared-key")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bearer.status(), axum::http::StatusCode::OK);
+
+        let anthropic = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-api-key", "deployment-shared-key")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "reasoning_effort": "none",
+                        "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "OK"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(anthropic.status(), axum::http::StatusCode::OK);
+
+        let health = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(health.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn shared_api_key_uses_anthropic_authentication_error_shape() {
+        let state = AppState {
+            shared_api_key: Some(Arc::<str>::from("deployment-shared-key")),
+            ..AppState::default()
+        };
+        let response = tower::ServiceExt::oneshot(
+            build_router_with_state(state),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-api-key", "wrong-key")
+                .body(axum::body::Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let value = response_json(response).await;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "authentication_error");
+    }
+
+    #[test]
+    fn kernel_timeouts_and_provider_queue_errors_map_to_gateway_statuses() {
+        let timeout = kernel_error_response(KernelError::RequestTimeout { timeout_ms: 50 });
+        assert_eq!(timeout.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+
+        let overloaded = kernel_error_response(KernelError::ProviderRejected(
+            "provider queue wait exceeded 100 ms".to_string(),
+        ));
+        assert_eq!(
+            overloaded.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -10797,6 +12611,141 @@ mod tests {
         assert_eq!(effort, ReasoningEffort::XHigh);
         assert!(provider_options.get("reasoning_effort").is_none());
         assert_eq!(provider_options["reasoning"]["summary"], "auto");
+    }
+
+    #[tokio::test]
+    async fn responses_preserve_current_sdk_provider_options() {
+        let request = parse_openai_responses_request(serde_json::json!({
+            "model": "mock",
+            "input": "options",
+            "service_tier": "priority",
+            "safety_identifier": "shared-user",
+            "prompt_cache_key": "cache-key",
+            "prompt_cache_retention": "24h",
+            "text": {
+                "verbosity": "low",
+                "format": {"type": "json_object"}
+            }
+        }))
+        .unwrap();
+        let execution = prepare_openai_responses_execution(
+            &ResponsesStore::new(None),
+            request,
+            &RequestContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let options = openai_provider_options(&execution.chat_request);
+        assert_eq!(options["service_tier"], "priority");
+        assert_eq!(options["safety_identifier"], "shared-user");
+        assert_eq!(options["prompt_cache_key"], "cache-key");
+        assert_eq!(options["prompt_cache_retention"], "24h");
+        assert_eq!(options["verbosity"], "low");
+        assert_eq!(options["response_format"]["type"], "json_object");
+    }
+
+    #[tokio::test]
+    async fn responses_background_runs_asynchronously_and_can_be_polled() {
+        let app = build_router();
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "input": "background",
+                        "background": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let created = response_json(response).await;
+        assert_eq!(created["background"], true);
+        assert_eq!(created["status"], "queued");
+        let response_id = created["id"].as_str().unwrap();
+
+        let mut completed = None;
+        for _ in 0..100 {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .uri(format!("/v1/responses/{response_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let value = response_json(response).await;
+            if value["status"] == "completed" {
+                completed = Some(value);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let completed = completed.expect("background response should complete");
+        assert_eq!(completed["background"], true);
+        assert!(
+            completed["output_text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_background_cancel_aborts_in_flight_execution() {
+        let app = build_router_with_provider(Arc::new(ConcurrentProbeProvider::default()));
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "input": "cancel background",
+                        "background": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let created = response_json(response).await;
+        let response_id = created["id"].as_str().unwrap();
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/responses/{response_id}/cancel"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "cancelled");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri(format!("/v1/responses/{response_id}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response_json(response).await["status"], "cancelled");
     }
 
     #[tokio::test]
@@ -12818,140 +14767,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_openai_batch_keeps_outputs_isolated_by_request() {
-        let app = build_router_with_provider(std::sync::Arc::new(InputEchoProvider));
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/batch")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "requests": [
-                            {"model": "mock", "messages": [{"role": "user", "content": "alpha conversation"}]},
-                            {"model": "mock", "messages": [{"role": "user", "content": "beta conversation"}]}
-                        ]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let value = response_json(response).await;
-        let first = value["data"][0]["response"]["choices"][0]["message"]["content"]
-            .as_str()
+    async fn routes_do_not_expose_nonstandard_batch_aliases() {
+        for path in [
+            "/chat/completions/batch",
+            "/v1/chat/completions/batch",
+            "/v1/v1/chat/completions/batch",
+            "/messages/batch",
+            "/v1/messages/batch",
+            "/v1/v1/messages/batch",
+        ] {
+            let response = tower::ServiceExt::oneshot(
+                build_router(),
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{\"requests\":[]}"))
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        let second = value["data"][1]["response"]["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap();
-        assert!(first.contains("alpha conversation"));
-        assert!(!first.contains("beta conversation"));
-        assert!(second.contains("beta conversation"));
-        assert!(!second.contains("alpha conversation"));
-    }
 
-    #[tokio::test]
-    async fn routes_openai_batch_runs_requests_concurrently() {
-        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
-        let app = build_router_with_provider(provider.clone());
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/batch")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "requests": [
-                            {"model": "mock", "messages": [{"role": "user", "content": "first"}]},
-                            {"model": "mock", "messages": [{"role": "user", "content": "second"}]}
-                        ]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert!(provider.max_in_flight() >= 2);
-    }
-
-    #[tokio::test]
-    async fn routes_openai_batch_limits_same_tenant_concurrency() {
-        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
-        let app = build_router_with_provider_and_tenant_limit(provider.clone(), 1);
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/batch")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "requests": [
-                            {
-                                "model": "mock",
-                                "metadata": {"tenant_id": "tenant-a"},
-                                "messages": [{"role": "user", "content": "first"}]
-                            },
-                            {
-                                "model": "mock",
-                                "metadata": {"tenant_id": "tenant-a"},
-                                "messages": [{"role": "user", "content": "second"}]
-                            }
-                        ]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(provider.max_in_flight(), 1);
-    }
-
-    #[tokio::test]
-    async fn routes_openai_batch_allows_different_tenants_to_run_concurrently() {
-        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
-        let app = build_router_with_provider_and_tenant_limit(provider.clone(), 1);
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/batch")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "requests": [
-                            {
-                                "model": "mock",
-                                "metadata": {"tenant_id": "tenant-a"},
-                                "messages": [{"role": "user", "content": "first"}]
-                            },
-                            {
-                                "model": "mock",
-                                "metadata": {"tenant_id": "tenant-b"},
-                                "messages": [{"role": "user", "content": "second"}]
-                            }
-                        ]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert!(provider.max_in_flight() >= 2);
+            assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
@@ -13202,20 +15040,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_anthropic_batch_returns_isolated_responses() {
-        let app = build_router_with_provider(std::sync::Arc::new(InputEchoProvider));
+    async fn routes_openai_files_and_batch_execute_durable_jsonl_workflow() {
+        let app = build_router();
+        let boundary = "miya-test-boundary";
+        let jsonl = serde_json::json!({
+            "custom_id": "request-1",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": "mock",
+                "reasoning_effort": "none",
+                "messages": [{"role": "user", "content": "official batch input"}]
+            }
+        })
+        .to_string();
+        let multipart = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"batch.jsonl\"\r\nContent-Type: application/jsonl\r\n\r\n{jsonl}\n\r\n--{boundary}--\r\n"
+        );
         let response = tower::ServiceExt::oneshot(
-            app,
+            app.clone(),
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/messages/batch")
+                .uri("/v1/files")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(multipart))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let file = response_json(response).await;
+        assert_eq!(file["purpose"], "batch");
+        let file_id = file["id"].as_str().unwrap();
+
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/batches")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
                     serde_json::json!({
-                        "requests": [
-                            {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "alpha anthropic"}]},
-                            {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "beta anthropic"}]}
-                        ]
+                        "input_file_id": file_id,
+                        "endpoint": "/v1/chat/completions",
+                        "completion_window": "24h"
                     })
                     .to_string(),
                 ))
@@ -13223,37 +15094,61 @@ mod tests {
         )
         .await
         .unwrap();
-
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let value = response_json(response).await;
-        assert_eq!(value["type"], "message_batch");
-        let first = value["data"][0]["response"]["content"][0]["text"]
-            .as_str()
+        let created = response_json(response).await;
+        let batch_id = created["id"].as_str().unwrap();
+        let mut completed = None;
+        for _ in 0..100 {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .uri(format!("/v1/batches/{batch_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        let second = value["data"][1]["response"]["content"][0]["text"]
-            .as_str()
+            let batch = response_json(response).await;
+            if batch["status"] == "completed" {
+                completed = Some(batch);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let completed = completed.expect("OpenAI batch should complete");
+        assert_eq!(completed["request_counts"]["completed"], 1);
+        let output_file_id = completed["output_file_id"].as_str().unwrap();
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri(format!("/v1/files/{output_file_id}/content"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
             .unwrap();
-        assert!(first.contains("alpha anthropic"));
-        assert!(!first.contains("beta anthropic"));
-        assert!(second.contains("beta anthropic"));
-        assert!(!second.contains("alpha anthropic"));
+        let output = String::from_utf8(body.to_vec()).unwrap();
+        assert!(output.contains("\"custom_id\":\"request-1\""));
+        assert!(output.contains("official batch input"));
     }
 
     #[tokio::test]
-    async fn routes_anthropic_batch_runs_requests_concurrently() {
-        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
-        let app = build_router_with_provider(provider.clone());
+    async fn routes_official_anthropic_batch_returns_jsonl_results() {
+        let app = build_router_with_provider(std::sync::Arc::new(InputEchoProvider));
         let response = tower::ServiceExt::oneshot(
-            app,
+            app.clone(),
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/messages/batch")
+                .uri("/v1/messages/batches")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
                     serde_json::json!({
                         "requests": [
-                            {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "first anthropic"}]},
-                            {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "second anthropic"}]}
+                            {"custom_id": "alpha", "params": {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "alpha anthropic"}]}},
+                            {"custom_id": "beta", "params": {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "beta anthropic"}]}}
                         ]
                     })
                     .to_string(),
@@ -13264,7 +15159,153 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let created = response_json(response).await;
+        assert_eq!(created["type"], "message_batch");
+        let batch_id = created["id"].as_str().unwrap();
+        let mut ended = false;
+        for _ in 0..100 {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .uri(format!("/v1/messages/batches/{batch_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let value = response_json(response).await;
+            if value["processing_status"] == "ended" {
+                ended = true;
+                assert_eq!(value["request_counts"]["succeeded"], 2);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ended);
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri(format!("/v1/messages/batches/{batch_id}/results"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines = String::from_utf8(body.to_vec()).unwrap();
+        assert!(lines.contains("\"custom_id\":\"alpha\""));
+        assert!(lines.contains("alpha anthropic"));
+        assert!(lines.contains("\"custom_id\":\"beta\""));
+        assert!(lines.contains("beta anthropic"));
+    }
+
+    #[tokio::test]
+    async fn routes_official_anthropic_batch_runs_requests_concurrently() {
+        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
+        let app = build_router_with_provider(provider.clone());
+        let response = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages/batches")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "requests": [
+                            {"custom_id": "first", "params": {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "first anthropic"}]}},
+                            {"custom_id": "second", "params": {"model": "mock", "max_tokens": 256, "messages": [{"role": "user", "content": "second anthropic"}]}}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let created = response_json(response).await;
+        let batch_id = created["id"].as_str().unwrap();
+        for _ in 0..100 {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .uri(format!("/v1/messages/batches/{batch_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            if response_json(response).await["processing_status"] == "ended" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(provider.max_in_flight() >= 2);
+    }
+
+    #[tokio::test]
+    async fn resilient_provider_retries_429_and_records_prometheus_metrics() {
+        let inner = Arc::new(FlakyRateLimitProvider::default());
+        let metrics = RuntimeMetrics::default();
+        let provider = ResilientProvider {
+            inner,
+            config: ResilienceConfig {
+                max_retries: 2,
+                base_delay: Duration::from_millis(1),
+                circuit_failure_threshold: 5,
+                circuit_cooldown: Duration::from_millis(10),
+            },
+            circuit: CircuitBreaker::default(),
+            metrics: metrics.clone(),
+        };
+        let request = provider_probe_request();
+        provider.invoke(request).await.unwrap();
+        assert_eq!(metrics.provider_attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.provider_retries.load(Ordering::Relaxed), 2);
+        assert!(
+            metrics
+                .prometheus()
+                .contains("miya_provider_retries_total 2")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_admission_limits_concurrency_across_requests() {
+        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
+        let managed: Arc<dyn ModelProvider> = Arc::new(AdmissionProvider {
+            inner: provider.clone(),
+            admission: ProviderAdmission {
+                semaphore: Some(Arc::new(Semaphore::new(1))),
+                wait_timeout: Duration::from_secs(5),
+            },
+        });
+        let app = build_router_with_provider(managed);
+        let request = |text: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "messages": [{"role": "user", "content": text}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(
+            tower::ServiceExt::oneshot(app.clone(), request("first")),
+            tower::ServiceExt::oneshot(app, request("second")),
+        );
+
+        assert_eq!(first.unwrap().status(), axum::http::StatusCode::OK);
+        assert_eq!(second.unwrap().status(), axum::http::StatusCode::OK);
+        assert_eq!(provider.max_in_flight(), 1);
     }
 
     #[tokio::test]
@@ -13272,26 +15313,17 @@ mod tests {
         let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
         let app = build_router_with_provider_and_tenant_limit(provider.clone(), 1);
         let response = tower::ServiceExt::oneshot(
-            app,
+            app.clone(),
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/messages/batch")
+                .uri("/v1/messages/batches")
                 .header("content-type", "application/json")
+                .header("x-tenant-id", "tenant-a")
                 .body(axum::body::Body::from(
                     serde_json::json!({
                         "requests": [
-                            {
-                                "model": "mock",
-                                "max_tokens": 256,
-                                "metadata": {"tenant_id": "tenant-a"},
-                                "messages": [{"role": "user", "content": "first anthropic"}]
-                            },
-                            {
-                                "model": "mock",
-                                "max_tokens": 256,
-                                "metadata": {"tenant_id": "tenant-a"},
-                                "messages": [{"role": "user", "content": "second anthropic"}]
-                            }
+                            {"custom_id": "first", "params": {"model": "mock", "max_tokens": 256, "metadata": {"max_parallel_agents": 1}, "messages": [{"role": "user", "content": "first anthropic"}]}},
+                            {"custom_id": "second", "params": {"model": "mock", "max_tokens": 256, "metadata": {"max_parallel_agents": 1}, "messages": [{"role": "user", "content": "second anthropic"}]}}
                         ]
                     })
                     .to_string(),
@@ -13302,6 +15334,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let created = response_json(response).await;
+        let batch_id = created["id"].as_str().unwrap();
+        for _ in 0..100 {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .uri(format!("/v1/messages/batches/{batch_id}"))
+                    .header("x-tenant-id", "tenant-a")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            if response_json(response).await["processing_status"] == "ended" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(provider.max_in_flight(), 1);
     }
 
@@ -13309,37 +15359,39 @@ mod tests {
     async fn routes_anthropic_batch_allows_different_tenants_to_run_concurrently() {
         let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
         let app = build_router_with_provider_and_tenant_limit(provider.clone(), 1);
-        let response = tower::ServiceExt::oneshot(
-            app,
+        let request = |tenant: &str, custom_id: &str| {
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/messages/batch")
+                .uri("/v1/messages/batches")
                 .header("content-type", "application/json")
+                .header("x-tenant-id", tenant)
                 .body(axum::body::Body::from(
                     serde_json::json!({
-                        "requests": [
-                            {
+                        "requests": [{
+                            "custom_id": custom_id,
+                            "params": {
                                 "model": "mock",
                                 "max_tokens": 256,
-                                "metadata": {"tenant_id": "tenant-a"},
-                                "messages": [{"role": "user", "content": "first anthropic"}]
-                            },
-                            {
-                                "model": "mock",
-                                "max_tokens": 256,
-                                "metadata": {"tenant_id": "tenant-b"},
-                                "messages": [{"role": "user", "content": "second anthropic"}]
+                                "messages": [{"role": "user", "content": custom_id}]
                             }
-                        ]
+                        }]
                     })
                     .to_string(),
                 ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(
+            tower::ServiceExt::oneshot(app.clone(), request("tenant-a", "first")),
+            tower::ServiceExt::oneshot(app, request("tenant-b", "second")),
+        );
+        assert_eq!(first.unwrap().status(), axum::http::StatusCode::OK);
+        assert_eq!(second.unwrap().status(), axum::http::StatusCode::OK);
+        for _ in 0..100 {
+            if provider.max_in_flight() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(provider.max_in_flight() >= 2);
     }
 
@@ -13505,69 +15557,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn routes_openai_batch_context_isolated_by_item_tenant() {
-        let temp = tempfile::tempdir().unwrap();
-        let context =
-            ApiContextManager::surreal_kv(SurrealKvContextStore::open(temp.path()).unwrap());
-        let app =
-            build_router_with_provider_and_context(std::sync::Arc::new(InputEchoProvider), context);
-
-        let _ = post_json(
-            app.clone(),
-            "/v1/chat/completions/batch",
-            serde_json::json!({
-                "requests": [
-                    {
-                        "model": "mock",
-                        "metadata": {
-                            "tenant_id": "batch-tenant-a",
-                            "context": {"id": "batch-shared-memory"}
-                        },
-                        "messages": [{"role": "user", "content": "batch tenant a silver-needle"}]
-                    },
-                    {
-                        "model": "mock",
-                        "metadata": {
-                            "tenant_id": "batch-tenant-b",
-                            "context": {"id": "batch-shared-memory"}
-                        },
-                        "messages": [{"role": "user", "content": "batch tenant b copper-marker"}]
-                    }
-                ]
-            }),
-        )
-        .await;
-
-        let tenant_b = post_json(
-            app,
-            "/v1/chat/completions",
-            serde_json::json!({
-                "model": "mock",
-                "metadata": {
-                    "tenant_id": "batch-tenant-b",
-                    "context": {
-                        "id": "batch-shared-memory",
-                        "query": "silver-needle",
-                        "recent_tail_chunks": 0,
-                        "append": false,
-                        "include_report": true
-                    }
-                },
-                "messages": [{"role": "user", "content": "retrieve silver needle"}]
-            }),
-        )
-        .await;
-
-        assert_eq!(tenant_b["context_cache"]["included_bytes"], 0);
-        assert!(
-            !tenant_b["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap()
-                .contains("silver-needle")
-        );
-    }
-
     #[derive(Debug)]
     struct InputEchoProvider;
 
@@ -13676,6 +15665,71 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FlakyRateLimitProvider {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FlakyRateLimitProvider {
+        async fn invoke(
+            &self,
+            request: provider_core::ProviderRequest,
+        ) -> Result<provider_core::ProviderResponse, ProviderError> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < 2 {
+                return Err(ProviderError::Http {
+                    provider: "test".to_string(),
+                    status: 429,
+                    code: Some("rate_limit_exceeded".to_string()),
+                    message: "slow down".to_string(),
+                    retry_after_ms: Some(1),
+                });
+            }
+            Ok(provider_core::ProviderResponse {
+                artifacts: vec![AgentArtifact::Text {
+                    id: ArtifactId::from("flaky-success"),
+                    scope: request.scope,
+                    text: "ok".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: ProviderUsage::default(),
+            })
+        }
+    }
+
+    fn provider_probe_request() -> provider_core::ProviderRequest {
+        provider_core::ProviderRequest {
+            scope: IsolationKey::new("tenant", "request", "conversation"),
+            task: SubtaskSpec {
+                task_id: TaskId::from("root"),
+                parent_task_id: None,
+                spawn_depth: 0,
+                role: AgentRole::Leader,
+                objective: "probe".to_string(),
+                input_artifact_refs: Vec::new(),
+                expected_outputs: vec![ArtifactKind::Text],
+                allowed_capabilities: CapabilitySet::from([Capability::Text]),
+                limits: AgentLimits::default(),
+            },
+            model: "mock".to_string(),
+            system_instructions: Vec::new(),
+            thinking_enabled: false,
+            thinking_format: ThinkingFormat::Auto,
+            input_text: "probe".to_string(),
+            messages: Vec::new(),
+            media_artifacts: Vec::new(),
+            artifacts: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            parallel_tool_calls: None,
+            tool_results: Vec::new(),
+            provider_options: serde_json::json!({}),
+        }
+    }
+
     #[derive(Debug, Default)]
     struct ConcurrentProbeProvider {
         in_flight: std::sync::atomic::AtomicUsize,
@@ -13704,6 +15758,12 @@ mod tests {
             self.in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
+            if request.task.objective.contains("orchestration plan") {
+                return Ok(route_spawn_plan_response(
+                    request,
+                    "concurrency probe model-selected workers",
+                ));
+            }
             Ok(provider_core::ProviderResponse {
                 artifacts: vec![AgentArtifact::Text {
                     id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),

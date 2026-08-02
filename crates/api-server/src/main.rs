@@ -1,5 +1,7 @@
 #[tokio::main]
 async fn main() {
+    let _observability =
+        api_server::init_observability().expect("failed to initialize observability");
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

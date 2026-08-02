@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -14,6 +17,7 @@ use serde_json::json;
 use thiserror::Error;
 
 const MAX_ORCHESTRATION_REPAIR_ATTEMPTS: usize = 3;
+const DEFAULT_MAX_SEMANTIC_REPAIR_ATTEMPTS: u8 = 2;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KernelError {
@@ -41,14 +45,20 @@ pub enum KernelError {
     #[error("spawn tool-call budget exceeds request policy")]
     BudgetExceeded,
     #[error("provider error: {0}")]
+    Provider(ProviderError),
+    #[error("provider error: {0}")]
     ProviderRejected(String),
+    #[error("request execution exceeded {timeout_ms} ms")]
+    RequestTimeout { timeout_ms: u64 },
+    #[error("agent {task_id:?} execution exceeded {timeout_ms} ms")]
+    AgentTimeout { task_id: TaskId, timeout_ms: u64 },
     #[error("failed to encrypt sub-agent state")]
     EncryptionFailed,
 }
 
 impl From<ProviderError> for KernelError {
     fn from(value: ProviderError) -> Self {
-        Self::ProviderRejected(value.to_string())
+        Self::Provider(value)
     }
 }
 
@@ -142,6 +152,22 @@ impl ToolLedger {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KernelPolicy {
     pub limits: ExecutionLimits,
+    pub semantic_verification: SemanticVerificationPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticVerificationPolicy {
+    pub enabled: bool,
+    pub max_repair_attempts: u8,
+}
+
+impl Default for SemanticVerificationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_repair_attempts: DEFAULT_MAX_SEMANTIC_REPAIR_ATTEMPTS,
+        }
+    }
 }
 
 impl KernelPolicy {
@@ -276,6 +302,22 @@ impl SpawnValidator {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SemanticVerdict {
+    passed: bool,
+    #[serde(default)]
+    issues: Vec<VerificationIssue>,
+    #[serde(default)]
+    covered_artifact_ids: Vec<String>,
+}
+
+struct SemanticVerificationResult {
+    final_text: String,
+    passed: bool,
+    issues: Vec<VerificationIssue>,
+    covered_artifact_ids: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelOutput {
     pub final_text: String,
@@ -333,6 +375,16 @@ where
     }
 
     pub async fn run(&self, request: NormalizedRequest) -> Result<KernelOutput, KernelError> {
+        let timeout_ms = self.policy.for_request(&request).limits.request_timeout_ms;
+        tokio::time::timeout(
+            Duration::from_millis(timeout_ms.max(1)),
+            self.run_inner(request),
+        )
+        .await
+        .map_err(|_| KernelError::RequestTimeout { timeout_ms })?
+    }
+
+    async fn run_inner(&self, request: NormalizedRequest) -> Result<KernelOutput, KernelError> {
         let request_policy = self.policy.for_request(&request);
         let scope = request.isolation_key();
         let mut store = ArtifactStore::new();
@@ -349,7 +401,7 @@ where
             &request.provider_options,
             u64::from(request_policy.limits.max_tokens_per_agent),
         );
-        let agent_provider_options = provider_options_with_min_output_tokens(
+        let auxiliary_agent_provider_options = provider_options_with_min_output_tokens(
             &request.provider_options,
             u64::from(request_policy.limits.max_tokens_per_agent),
         );
@@ -384,7 +436,11 @@ where
                 Capability::Spawn,
                 Capability::ToolCall,
             ]),
-            limits: AgentLimits::default(),
+            limits: AgentLimits {
+                max_tokens: request_policy.limits.max_tokens_per_agent,
+                max_tool_calls: request_policy.limits.max_tool_calls_per_agent,
+                timeout_ms: request_policy.limits.agent_timeout_ms,
+            },
         };
 
         let mut graph = TaskGraph::new(root_task_id.clone());
@@ -395,8 +451,7 @@ where
         if request.reasoning_effort.is_direct() {
             trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
             let root_response = self
-                .provider
-                .invoke(ProviderRequest {
+                .invoke_provider(ProviderRequest {
                     scope: scope.clone(),
                     task: root_task.clone(),
                     model: request.model.clone(),
@@ -434,8 +489,7 @@ where
             {
                 trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
                 let root_response = self
-                    .provider
-                    .invoke(ProviderRequest {
+                    .invoke_provider(ProviderRequest {
                         scope: scope.clone(),
                         task: root_task.clone(),
                         model: request.model.clone(),
@@ -484,8 +538,7 @@ where
                 let planner_input = orchestration_planner_input(&request, &request_policy);
                 trace_events.push(trace_agent_input(&planner_task, planner_input.clone()));
                 let mut planner_response = self
-                    .provider
-                    .invoke(ProviderRequest {
+                    .invoke_provider(ProviderRequest {
                         scope: scope.clone(),
                         task: planner_task.clone(),
                         model: request.model.clone(),
@@ -520,8 +573,7 @@ where
                     );
                     trace_events.push(trace_agent_input(&repair_task, repair_input.clone()));
                     let repair_response = self
-                        .provider
-                        .invoke(ProviderRequest {
+                        .invoke_provider(ProviderRequest {
                             scope: scope.clone(),
                             task: repair_task.clone(),
                             model: request.model.clone(),
@@ -578,8 +630,7 @@ where
                 if root_preface_artifacts.is_empty() {
                     trace_events.push(trace_agent_input(&root_task, flatten_text(&request)));
                     let root_response = self
-                        .provider
-                        .invoke(ProviderRequest {
+                        .invoke_provider(ProviderRequest {
                             scope: scope.clone(),
                             task: root_task.clone(),
                             model: request.model.clone(),
@@ -625,7 +676,8 @@ where
         let child_requests = tasks
             .into_iter()
             .enumerate()
-            .map(|(index, task)| {
+            .map(|(index, mut task)| {
+                task.limits.timeout_ms = request_policy.limits.agent_timeout_ms;
                 let artifacts = task
                     .input_artifact_refs
                     .iter()
@@ -660,8 +712,8 @@ where
         let parallel_limit = usize::from(request_policy.limits.max_parallel_agents.max(1));
         let child_results = stream::iter(child_requests.into_iter().map(
             |(index, task, input_text, request)| async move {
-                let response = self.provider.invoke(request).await?;
-                Ok::<_, ProviderError>((index, task, input_text, response))
+                let response = self.invoke_provider(request).await?;
+                Ok::<_, KernelError>((index, task, input_text, response))
             },
         ))
         .buffer_unordered(parallel_limit)
@@ -669,7 +721,7 @@ where
         .await;
         let mut child_results = child_results
             .into_iter()
-            .collect::<Result<Vec<_>, ProviderError>>()?;
+            .collect::<Result<Vec<_>, KernelError>>()?;
         child_results.sort_by_key(|(index, _, _, _)| *index);
         for child_result in child_results {
             let (_, task, input_text, child_response) = child_result;
@@ -717,8 +769,7 @@ where
                 continuation_input.clone(),
             ));
             let continuation_response = self
-                .provider
-                .invoke(ProviderRequest {
+                .invoke_provider(ProviderRequest {
                     scope: scope.clone(),
                     task: root_continuation_task.clone(),
                     model: request.model.clone(),
@@ -733,7 +784,7 @@ where
                     tool_choice: request.tool_choice.clone(),
                     parallel_tool_calls: request.parallel_tool_calls,
                     tool_results: request.tool_results.clone(),
-                    provider_options: internal_agent_provider_options.clone(),
+                    provider_options: request.provider_options.clone(),
                 })
                 .await?;
             accumulate_usage(&mut usage, &mut provider_call_count, &continuation_response);
@@ -774,14 +825,17 @@ where
                 input_artifact_refs: Vec::new(),
                 expected_outputs: vec![ArtifactKind::Text],
                 allowed_capabilities: CapabilitySet::from([Capability::Text]),
-                limits: AgentLimits::default(),
+                limits: AgentLimits {
+                    max_tokens: request_policy.limits.max_tokens_per_agent,
+                    max_tool_calls: 0,
+                    timeout_ms: request_policy.limits.agent_timeout_ms,
+                },
             };
             graph.insert_task(summary_task.clone());
             let summary_input = reasoning_summary_input(&request, &trace_events);
             trace_events.push(trace_agent_input(&summary_task, summary_input.clone()));
             let summary_response = self
-                .provider
-                .invoke(ProviderRequest {
+                .invoke_provider(ProviderRequest {
                     scope: scope.clone(),
                     task: summary_task.clone(),
                     model: request.model.clone(),
@@ -796,7 +850,7 @@ where
                     tool_choice: ToolChoice::None,
                     parallel_tool_calls: None,
                     tool_results: Vec::new(),
-                    provider_options: agent_provider_options.clone(),
+                    provider_options: auxiliary_agent_provider_options.clone(),
                 })
                 .await?;
             accumulate_usage(&mut usage, &mut provider_call_count, &summary_response);
@@ -815,14 +869,17 @@ where
                 input_artifact_refs: Vec::new(),
                 expected_outputs: vec![ArtifactKind::Text],
                 allowed_capabilities: CapabilitySet::from([Capability::Text]),
-                limits: AgentLimits::default(),
+                limits: AgentLimits {
+                    max_tokens: request_policy.limits.max_tokens_per_agent,
+                    max_tool_calls: 0,
+                    timeout_ms: request_policy.limits.agent_timeout_ms,
+                },
             };
             graph.insert_task(synth_task.clone());
             let synth_input = synthesis_input(&request, &text_artifacts);
             trace_events.push(trace_agent_input(&synth_task, synth_input.clone()));
             let synth_response = self
-                .provider
-                .invoke(ProviderRequest {
+                .invoke_provider(ProviderRequest {
                     scope: scope.clone(),
                     task: synth_task.clone(),
                     model: request.model.clone(),
@@ -837,7 +894,7 @@ where
                     tool_choice: ToolChoice::None,
                     parallel_tool_calls: None,
                     tool_results: Vec::new(),
-                    provider_options: agent_provider_options.clone(),
+                    provider_options: request.provider_options.clone(),
                 })
                 .await?;
             accumulate_usage(&mut usage, &mut provider_call_count, &synth_response);
@@ -848,14 +905,46 @@ where
         } else {
             String::new()
         };
-        let final_text = if root_unresolved.is_empty() && !final_text.trim().is_empty() {
+        let mut final_text = if root_unresolved.is_empty() && !final_text.trim().is_empty() {
             normalize_structured_text_layout(&final_text)
         } else {
             final_text
         };
 
+        let semantic_verification = if request_policy.semantic_verification.enabled
+            && !request.reasoning_effort.is_direct()
+            && root_unresolved.is_empty()
+            && !final_text.trim().is_empty()
+        {
+            self.run_semantic_verification(
+                &request,
+                &request_policy,
+                &scope,
+                &root_task_id,
+                &system_instructions,
+                &text_artifacts,
+                &mut graph,
+                &mut usage,
+                &mut provider_call_count,
+                &mut trace_events,
+                final_text,
+            )
+            .await
+        } else {
+            SemanticVerificationResult {
+                final_text,
+                passed: true,
+                issues: Vec::new(),
+                covered_artifact_ids: text_artifacts
+                    .iter()
+                    .map(|artifact| artifact.id().as_ref().to_string())
+                    .collect(),
+            }
+        };
+        final_text = semantic_verification.final_text;
+
         let token_used = usage.input_tokens.saturating_add(usage.output_tokens);
-        let mut issues = Vec::new();
+        let mut issues = semantic_verification.issues;
         if !root_unresolved.is_empty() {
             issues.push(VerificationIssue {
                 code: "unresolved_tool_calls".to_string(),
@@ -865,9 +954,10 @@ where
         if let Some(issue) = planning_issue {
             issues.push(issue);
         }
-        let passed = !issues
-            .iter()
-            .any(|issue| issue.code != "missing_model_spawn_plan");
+        let passed = semantic_verification.passed
+            && !issues
+                .iter()
+                .any(|issue| issue.code != "missing_model_spawn_plan");
         let verification = VerificationReport {
             request_id: request.request_id.clone(),
             passed,
@@ -877,7 +967,9 @@ where
                 .map(|artifact| ArtifactCoverage {
                     artifact_id: artifact.id(),
                     kind: ArtifactKind::Text,
-                    covered: true,
+                    covered: semantic_verification
+                        .covered_artifact_ids
+                        .contains(artifact.id().as_ref()),
                 })
                 .collect(),
             unresolved_tool_calls: root_unresolved,
@@ -901,15 +993,236 @@ where
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn run_semantic_verification(
+        &self,
+        request: &NormalizedRequest,
+        policy: &KernelPolicy,
+        scope: &IsolationKey,
+        root_task_id: &TaskId,
+        system_instructions: &[String],
+        evidence: &[AgentArtifact],
+        graph: &mut TaskGraph,
+        usage: &mut ProviderUsage,
+        provider_call_count: &mut u32,
+        trace_events: &mut Vec<KernelTraceEvent>,
+        mut candidate: String,
+    ) -> SemanticVerificationResult {
+        let mut repair_attempts = 0_u8;
+        loop {
+            let verifier_task = SubtaskSpec {
+                task_id: TaskId::from(format!("semantic-verifier-{repair_attempts}")),
+                parent_task_id: Some(root_task_id.clone()),
+                spawn_depth: 0,
+                role: AgentRole::Verifier,
+                objective: "independently verify the candidate answer against the user request and worker evidence".to_string(),
+                input_artifact_refs: Vec::new(),
+                expected_outputs: vec![ArtifactKind::Verification],
+                allowed_capabilities: CapabilitySet::from([Capability::Text, Capability::Verify]),
+                limits: AgentLimits {
+                    max_tokens: policy.limits.max_tokens_per_agent,
+                    max_tool_calls: 0,
+                    timeout_ms: policy.limits.agent_timeout_ms,
+                },
+            };
+            graph.insert_task(verifier_task.clone());
+            let verifier_input = semantic_verifier_input(request, evidence, &candidate);
+            trace_events.push(trace_agent_input(&verifier_task, verifier_input.clone()));
+            let verifier_response = self
+                .invoke_provider(ProviderRequest {
+                    scope: scope.clone(),
+                    task: verifier_task.clone(),
+                    model: request.model.clone(),
+                    system_instructions: system_instructions.to_vec(),
+                    thinking_enabled: request.thinking_enabled,
+                    thinking_format: request.thinking_format.clone(),
+                    input_text: verifier_input,
+                    messages: Vec::new(),
+                    media_artifacts: request.media_artifacts.clone(),
+                    artifacts: evidence.to_vec(),
+                    tools: Vec::new(),
+                    tool_choice: ToolChoice::None,
+                    parallel_tool_calls: None,
+                    tool_results: Vec::new(),
+                    provider_options: provider_options_with_min_output_tokens(
+                        &request.provider_options,
+                        u64::from(policy.limits.max_tokens_per_agent),
+                    ),
+                })
+                .await;
+            let verifier_response = match verifier_response {
+                Ok(response) => response,
+                Err(error) => {
+                    return SemanticVerificationResult {
+                        final_text: candidate,
+                        passed: false,
+                        issues: vec![VerificationIssue {
+                            code: "semantic_verifier_error".to_string(),
+                            message: error.to_string(),
+                        }],
+                        covered_artifact_ids: BTreeSet::new(),
+                    };
+                }
+            };
+            accumulate_usage(usage, provider_call_count, &verifier_response);
+            trace_events.extend(trace_events_from_response(
+                &verifier_task,
+                &verifier_response,
+            ));
+            let verdict = match semantic_verdict_from_response(&verifier_response) {
+                Some(verdict) => verdict,
+                None => {
+                    return SemanticVerificationResult {
+                        final_text: candidate,
+                        passed: false,
+                        issues: vec![VerificationIssue {
+                            code: "invalid_semantic_verdict".to_string(),
+                            message: "semantic verifier did not return the required JSON verdict"
+                                .to_string(),
+                        }],
+                        covered_artifact_ids: BTreeSet::new(),
+                    };
+                }
+            };
+            let covered_artifact_ids = verdict
+                .covered_artifact_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if verdict.passed {
+                return SemanticVerificationResult {
+                    final_text: candidate,
+                    passed: true,
+                    issues: Vec::new(),
+                    covered_artifact_ids,
+                };
+            }
+            let issues = if verdict.issues.is_empty() {
+                vec![VerificationIssue {
+                    code: "semantic_verification_failed".to_string(),
+                    message: "semantic verifier rejected the candidate without issue details"
+                        .to_string(),
+                }]
+            } else {
+                verdict.issues
+            };
+            if repair_attempts >= policy.semantic_verification.max_repair_attempts {
+                return SemanticVerificationResult {
+                    final_text: candidate,
+                    passed: false,
+                    issues,
+                    covered_artifact_ids,
+                };
+            }
+
+            repair_attempts = repair_attempts.saturating_add(1);
+            let repair_task = SubtaskSpec {
+                task_id: TaskId::from(format!("semantic-repair-{repair_attempts}")),
+                parent_task_id: Some(root_task_id.clone()),
+                spawn_depth: 0,
+                role: AgentRole::Synthesizer,
+                objective: "repair the candidate answer using bounded verifier feedback and existing evidence".to_string(),
+                input_artifact_refs: Vec::new(),
+                expected_outputs: vec![ArtifactKind::Text],
+                allowed_capabilities: CapabilitySet::from([Capability::Text]),
+                limits: AgentLimits {
+                    max_tokens: policy.limits.max_tokens_per_agent,
+                    max_tool_calls: 0,
+                    timeout_ms: policy.limits.agent_timeout_ms,
+                },
+            };
+            graph.insert_task(repair_task.clone());
+            let repair_input = semantic_repair_input(request, evidence, &candidate, &issues);
+            trace_events.push(trace_agent_input(&repair_task, repair_input.clone()));
+            let repair_response = self
+                .invoke_provider(ProviderRequest {
+                    scope: scope.clone(),
+                    task: repair_task.clone(),
+                    model: request.model.clone(),
+                    system_instructions: system_instructions.to_vec(),
+                    thinking_enabled: request.thinking_enabled,
+                    thinking_format: request.thinking_format.clone(),
+                    input_text: repair_input,
+                    messages: Vec::new(),
+                    media_artifacts: request.media_artifacts.clone(),
+                    artifacts: evidence.to_vec(),
+                    tools: Vec::new(),
+                    tool_choice: ToolChoice::None,
+                    parallel_tool_calls: None,
+                    tool_results: Vec::new(),
+                    provider_options: request.provider_options.clone(),
+                })
+                .await;
+            let repair_response = match repair_response {
+                Ok(response) => response,
+                Err(error) => {
+                    let mut issues = issues;
+                    issues.push(VerificationIssue {
+                        code: "semantic_repair_error".to_string(),
+                        message: error.to_string(),
+                    });
+                    return SemanticVerificationResult {
+                        final_text: candidate,
+                        passed: false,
+                        issues,
+                        covered_artifact_ids,
+                    };
+                }
+            };
+            accumulate_usage(usage, provider_call_count, &repair_response);
+            trace_events.extend(trace_events_from_response(&repair_task, &repair_response));
+            let repaired = synthesize_text(&repair_response.artifacts);
+            if repaired.trim().is_empty() {
+                let mut issues = issues;
+                issues.push(VerificationIssue {
+                    code: "empty_semantic_repair".to_string(),
+                    message: "semantic repair returned no candidate answer".to_string(),
+                });
+                return SemanticVerificationResult {
+                    final_text: candidate,
+                    passed: false,
+                    issues,
+                    covered_artifact_ids,
+                };
+            }
+            candidate = normalize_structured_text_layout(&repaired);
+        }
+    }
+
+    async fn invoke_provider(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderResponse, KernelError> {
+        let task_id = request.task.task_id.clone();
+        let timeout_ms = if request.task.limits.timeout_ms == 0 {
+            AgentLimits::default().timeout_ms
+        } else {
+            request.task.limits.timeout_ms
+        };
+        tokio::time::timeout(
+            Duration::from_millis(timeout_ms.max(1)),
+            self.provider.invoke(request),
+        )
+        .await
+        .map_err(|_| KernelError::AgentTimeout {
+            task_id,
+            timeout_ms,
+        })?
+        .map_err(KernelError::from)
+    }
+
     pub async fn stream_root(
         &self,
         request: NormalizedRequest,
     ) -> Result<ProviderStream, KernelError> {
         let request_policy = self.policy.for_request(&request);
         let scope = request.isolation_key();
-        let root_task = root_task(&scope, &request);
-        self.provider
-            .stream(ProviderRequest {
+        let mut root_task = root_task(&scope, &request);
+        root_task.limits.timeout_ms = request_policy.limits.agent_timeout_ms;
+        let task_id = root_task.task_id.clone();
+        let timeout_ms = root_task.limits.timeout_ms;
+        tokio::time::timeout(
+            Duration::from_millis(timeout_ms.max(1)),
+            self.provider.stream(ProviderRequest {
                 scope,
                 task: root_task,
                 model: request.model.clone(),
@@ -925,9 +1238,14 @@ where
                 parallel_tool_calls: request.parallel_tool_calls,
                 tool_results: request.tool_results.clone(),
                 provider_options: request.provider_options.clone(),
-            })
-            .await
-            .map_err(KernelError::from)
+            }),
+        )
+        .await
+        .map_err(|_| KernelError::AgentTimeout {
+            task_id,
+            timeout_ms,
+        })?
+        .map_err(KernelError::from)
     }
 
     fn apply_provider_response(
@@ -1130,6 +1448,16 @@ impl ModelProvider for MockProvider {
             }
             AgentRole::Worker => format!("child completed: {}", request.task.objective),
             AgentRole::ReasoningSummarizer => mock_reasoning_summary(&request.input_text),
+            AgentRole::Verifier => serde_json::json!({
+                "passed": true,
+                "issues": [],
+                "covered_artifact_ids": request
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.id().as_ref().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .to_string(),
             AgentRole::Synthesizer => mock_synthesis_text(&request.input_text),
             _ => format!("Here is a clear, usable answer: {}", request.input_text),
         };
@@ -1230,12 +1558,30 @@ fn flatten_text(request: &NormalizedRequest) -> String {
         .iter()
         .flat_map(|message| message.content.iter())
         .filter_map(|part| match part {
-            NormalizedContentPart::Text { text } => Some(text.as_str()),
+            NormalizedContentPart::Text { text } => Some(text.clone()),
+            NormalizedContentPart::ProviderContent { value, .. } => {
+                Some(provider_content_prompt_text(value))
+            }
             NormalizedContentPart::ToolCall { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn provider_content_prompt_text(value: &serde_json::Value) -> String {
+    if let Some(text) = value
+        .get("text")
+        .or_else(|| value.get("thinking"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return text.to_string();
+    }
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("provider_content");
+    format!("[{kind} content attached]")
 }
 
 fn system_instructions(request: &NormalizedRequest) -> Vec<String> {
@@ -1246,6 +1592,9 @@ fn system_instructions(request: &NormalizedRequest) -> Vec<String> {
         .flat_map(|message| message.content.iter())
         .filter_map(|part| match part {
             NormalizedContentPart::Text { text } => Some(text.clone()),
+            NormalizedContentPart::ProviderContent { value, .. } => {
+                Some(provider_content_prompt_text(value))
+            }
             _ => None,
         })
         .collect()
@@ -1376,10 +1725,10 @@ fn collect_stateful_handles(value: &serde_json::Value, handles: &mut BTreeSet<St
     match value {
         serde_json::Value::Object(object) => {
             for (key, value) in object {
-                if is_state_handle_field(key) {
-                    if let Some(handle) = state_handle_value(value) {
-                        handles.insert(format!("{key}={handle}"));
-                    }
+                if is_state_handle_field(key)
+                    && let Some(handle) = state_handle_value(value)
+                {
+                    handles.insert(format!("{key}={handle}"));
                 }
                 collect_stateful_handles(value, handles);
             }
@@ -1722,6 +2071,85 @@ fn planner_attempt_summary(response: &ProviderResponse) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+fn semantic_verifier_input(
+    request: &NormalizedRequest,
+    evidence: &[AgentArtifact],
+    candidate: &str,
+) -> String {
+    format!(
+        "Act as an independent semantic verifier. Check factual consistency, instruction coverage, contradictions, unsupported claims, and whether the candidate directly answers the user. Use only the root-visible request and evidence below. Do not repair the answer. Return ONLY one JSON object with this exact shape: {json_shape}. Every issue must have a stable short code and actionable message. covered_artifact_ids must list only evidence IDs actually checked.\n\nRoot-visible request:\n{request_text}\n\nEvidence:\n{evidence_text}\n\nCandidate answer:\n{candidate}",
+        json_shape = r#"{"passed":true,"issues":[{"code":"...","message":"..."}],"covered_artifact_ids":["..."]}"#,
+        request_text = flatten_text(request),
+        evidence_text = semantic_evidence_text(evidence),
+    )
+}
+
+fn semantic_repair_input(
+    request: &NormalizedRequest,
+    evidence: &[AgentArtifact],
+    candidate: &str,
+    issues: &[VerificationIssue],
+) -> String {
+    format!(
+        "Repair the candidate answer using only the root-visible request, existing evidence, and verifier issues below. Resolve every issue without inventing evidence. Preserve the caller's output format, stop conditions, and requested level of detail. Return only the complete replacement answer.\n\nRoot-visible request:\n{request_text}\n\nEvidence:\n{evidence_text}\n\nVerifier issues:\n{issues}\n\nCandidate answer:\n{candidate}",
+        request_text = flatten_text(request),
+        evidence_text = semantic_evidence_text(evidence),
+        issues = serde_json::to_string(issues).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+fn semantic_evidence_text(evidence: &[AgentArtifact]) -> String {
+    let rendered = evidence
+        .iter()
+        .filter_map(|artifact| match artifact {
+            AgentArtifact::Text { id, text, .. } => {
+                Some(format!("artifact_id={}\n{}", id.as_ref(), text))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if rendered.is_empty() {
+        "(no worker text artifacts)".to_string()
+    } else {
+        rendered
+    }
+}
+
+fn semantic_verdict_from_response(response: &ProviderResponse) -> Option<SemanticVerdict> {
+    response.artifacts.iter().find_map(|artifact| {
+        let AgentArtifact::Text { text, .. } = artifact else {
+            return None;
+        };
+        let candidate = semantic_json_object_candidate(text)?;
+        serde_json::from_str(&candidate).ok()
+    })
+}
+
+fn semantic_json_object_candidate(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed.to_string());
+    }
+    if let Some(after_fence) = trimmed.strip_prefix("```") {
+        let after_language = after_fence
+            .split_once('\n')
+            .map(|(_, rest)| rest)
+            .unwrap_or(after_fence);
+        let fenced = after_language
+            .rsplit_once("```")
+            .map(|(before, _)| before)
+            .unwrap_or(after_language)
+            .trim();
+        if fenced.starts_with('{') && fenced.ends_with('}') {
+            return Some(fenced.to_string());
+        }
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (end > start).then(|| trimmed[start..=end].to_string())
 }
 
 fn child_agent_input(request: &NormalizedRequest, task: &SubtaskSpec) -> String {
@@ -2225,6 +2653,7 @@ mod tests {
                 max_agents_per_request: 1,
                 ..ExecutionLimits::default()
             },
+            ..KernelPolicy::default()
         });
 
         let too_deep = SpawnPlan {
@@ -2314,6 +2743,7 @@ mod tests {
                 max_total_tool_calls: 1,
                 ..ExecutionLimits::default()
             },
+            ..KernelPolicy::default()
         });
         let plan = SpawnPlan {
             parent_task_id: root.clone(),
@@ -2731,6 +3161,14 @@ mod tests {
                 && entry.options.get("stop").is_none()
                 && entry.options.get("stopping_strings").is_none()
         }));
+        assert!(seen.iter().any(|entry| {
+            entry.role == AgentRole::Synthesizer
+                && entry.options["max_tokens"] == 8
+                && entry.options["max_new_tokens"] == 65536
+                && entry.options["temperature"] == 0.2
+                && entry.options["stop"] == serde_json::json!(["client-facing-stop"])
+                && entry.options["stopping_strings"] == serde_json::json!(["client-facing-stop"])
+        }));
     }
 
     #[tokio::test]
@@ -3079,6 +3517,150 @@ mod tests {
         assert_eq!(output.encrypted_subagent_state.len(), 0);
         assert_eq!(output.provider_call_count, 1);
         assert_eq!(output.final_text, "root final answer");
+    }
+
+    #[tokio::test]
+    async fn kernel_enforces_agent_timeout() {
+        let mut policy = KernelPolicy::default();
+        policy.limits.request_timeout_ms = 100;
+        policy.limits.agent_timeout_ms = 5;
+        let runner = KernelRunner::new(DelayedProvider { delay_ms: 25 }, policy);
+
+        let error = runner.run(text_request("timeout agent")).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            KernelError::AgentTimeout { timeout_ms: 5, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn kernel_enforces_request_timeout() {
+        let mut policy = KernelPolicy::default();
+        policy.limits.request_timeout_ms = 5;
+        policy.limits.agent_timeout_ms = 100;
+        let runner = KernelRunner::new(DelayedProvider { delay_ms: 25 }, policy);
+
+        let error = runner
+            .run(text_request("timeout request"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, KernelError::RequestTimeout { timeout_ms: 5 });
+    }
+
+    #[derive(Default)]
+    struct SemanticRepairProvider {
+        verifier_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SemanticRepairProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            if request.task.role == AgentRole::Verifier {
+                let call = self
+                    .verifier_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let passed = call > 0;
+                let issues = if passed {
+                    Vec::new()
+                } else {
+                    vec![serde_json::json!({
+                        "code": "missing_evidence",
+                        "message": "candidate must explicitly cite the worker evidence"
+                    })]
+                };
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("verdict-{call}")),
+                        scope: request.scope,
+                        text: serde_json::json!({
+                            "passed": passed,
+                            "issues": issues,
+                            "covered_artifact_ids": request
+                                .artifacts
+                                .iter()
+                                .map(|artifact| artifact.id().as_ref().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: ProviderUsage::default(),
+                });
+            }
+            if request.task.role == AgentRole::Synthesizer
+                && request.task.objective.contains("repair the candidate")
+            {
+                return Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from("semantic-repair-output"),
+                        scope: request.scope,
+                        text: "Repaired answer grounded in worker evidence.".to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: ProviderUsage::default(),
+                });
+            }
+            MockProvider.invoke(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_checks_artifact_coverage_after_synthesis() {
+        let mut policy = KernelPolicy::default();
+        policy.semantic_verification.enabled = true;
+        policy.semantic_verification.max_repair_attempts = 2;
+        let runner = KernelRunner::new(MockProvider, policy);
+        let output = runner
+            .run(text_request("spawn workers and produce a verified answer"))
+            .await
+            .unwrap();
+
+        assert!(output.verification.passed);
+        assert!(!output.verification.artifact_coverage.is_empty());
+        assert!(
+            output
+                .verification
+                .artifact_coverage
+                .iter()
+                .all(|coverage| coverage.covered)
+        );
+        assert!(output.trace_events.iter().any(|event| matches!(
+            event,
+            KernelTraceEvent::AgentInput {
+                role: AgentRole::Verifier,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_runs_bounded_repair_and_rechecks() {
+        let mut policy = KernelPolicy::default();
+        policy.semantic_verification.enabled = true;
+        policy.semantic_verification.max_repair_attempts = 1;
+        let provider = std::sync::Arc::new(SemanticRepairProvider::default());
+        let runner = KernelRunner::new(provider.clone(), policy);
+        let output = runner
+            .run(text_request("spawn workers and repair a grounded answer"))
+            .await
+            .unwrap();
+
+        assert!(output.verification.passed);
+        assert_eq!(
+            provider
+                .verifier_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            output.final_text,
+            "Repaired answer grounded in worker evidence."
+        );
     }
 
     #[tokio::test]
@@ -3921,6 +4503,22 @@ mod tests {
         role: AgentRole,
         objective: String,
         options: serde_json::Value,
+    }
+
+    #[derive(Debug)]
+    struct DelayedProvider {
+        delay_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for DelayedProvider {
+        async fn invoke(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            Ok(ProviderResponse::default())
+        }
     }
 
     #[derive(Clone, Default)]

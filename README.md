@@ -8,10 +8,10 @@ Miya API 是一個以 Rust 實作的 OpenAI Responses、OpenAI Chat Completions 
 - bounded agent execution
 - structured intermediate artifacts
 - scoped tool-call accounting
-- verification loop
+- independent semantic verification with a bounded repair loop
 - final synthesis
 - request-level isolation
-- multimodal image input
+- multimodal image, audio, file, document, citation, and provider-native content blocks
 - OpenAI/Anthropic tool-call 相容輸出
 - true provider token streaming for direct/root streaming paths
 - structured usage telemetry with output-token accounting
@@ -26,11 +26,11 @@ Miya API 是一個以 Rust 實作的 OpenAI Responses、OpenAI Chat Completions 
 
 商用部署時的核心邊界是：
 
-- Client compatibility: 前端仍使用標準 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`、stream、batch、tool-call 格式。
+- Client compatibility: 前端仍使用標準 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`、stream、tool-call 格式。
 - Provider efficiency: 子代理會以有界並行向同一後端發送多個標準 provider request，預設最多 4 個 child-agent request 同時在飛。
 - Isolation: tenant、request、conversation、artifact、tool-call、context cache key 都有明確隔離，避免批量請求或多用戶場景串話。
 - Cache discipline: context-pack cache 依 tenant/context/revision/retrieval policy/model/tools/thinking/provider options/system hash 切分，避免不同後端格式、模型或工具 schema 共用錯誤上下文。
-- Observability: stdout JSONL telemetry 記錄 provider call count、child agent count、工具數、token usage、context cache hit/miss；可選 training trace 記錄輸入輸出與中間 artifact。
+- Observability: stdout JSONL telemetry、Prometheus `/metrics`、W3C trace-context 與可選 OTLP/OpenTelemetry tracing 記錄 provider retry/circuit、durable job、token、agent 與 context 行為；可選 training trace 記錄輸入輸出與中間 artifact。
 
 仍需注意：
 
@@ -89,8 +89,10 @@ crates/
 11. Root-visible unresolved tool calls are returned to the user if tools are required.
 12. If public reasoning is enabled, one dedicated `reasoning-summary` agent summarizes worker outputs for the frontend reasoning field only.
 13. If no root tool call remains, a synthesizer reads the original worker artifacts and returns one natural final answer.
-14. Optional context metadata records the exchange into SurrealKV.
-15. The API emits a structured `api_usage` telemetry record for backend accounting.
+14. An independent semantic verifier checks instruction coverage, contradictions, unsupported claims, and artifact coverage; failed verdicts enter a configured bounded repair-and-recheck loop.
+15. Files, batches, Message Batches, and background Responses use a durable filesystem object/blob store and process-wide asynchronous job scheduler with cancellation and restart recovery.
+16. Optional context metadata records the exchange into SurrealKV.
+17. The API emits structured telemetry, Prometheus counters, and OpenTelemetry spans.
 
 Internal child-agent reasoning, tool calls and raw outputs are not exposed by default. Only root-visible tool calls and the final synthesized answer are public unless the caller explicitly asks for encrypted sub-agent state.
 
@@ -103,15 +105,23 @@ GET  /health
 GET  /models
 GET  /v1/models
 GET  /v1/v1/models
+GET  /v1/models/{model_id}
+GET  /metrics
+POST /v1/files
+GET  /v1/files
+GET  /v1/files/{file_id}
+GET  /v1/files/{file_id}/content
+DELETE /v1/files/{file_id}
+POST /v1/batches
+GET  /v1/batches
+GET  /v1/batches/{batch_id}
+POST /v1/batches/{batch_id}/cancel
 POST /completions
 POST /v1/completions
 POST /v1/v1/completions
 POST /chat/completions
 POST /v1/chat/completions
 POST /v1/v1/chat/completions
-POST /chat/completions/batch
-POST /v1/chat/completions/batch
-POST /v1/v1/chat/completions/batch
 POST /responses
 GET  /responses
 POST /v1/responses
@@ -126,16 +136,38 @@ POST /v1/responses/input_tokens
 POST /v1/responses/compact
 ```
 
-Canonical OpenAI-compatible base URL is `/v1`. The root and double-`/v1` aliases exist for frontends that either omit `/v1` or append `/v1` themselves. In practice:
+Canonical OpenAI-compatible base URL is `/v1`. The root and double-`/v1` aliases exist for frontends that either omit `/v1` or append `/v1` themselves. 非標準的 `/chat/completions/batch` aliases 不再提供。官方 Files/Batch 流程已實作：先以 multipart 上傳 `purpose=batch` JSONL 至 `/v1/files`，再建立 `/v1/batches`，並透過 retrieve/list/cancel 與 output/error file lifecycle 非同步處理。此閘道目前接受其實際可執行的 batch endpoints：`/v1/chat/completions`、`/v1/completions`、`/v1/responses`；其他官方 endpoint 會明確回傳 `400`，不會假裝已處理。Metadata 與 blobs 以 atomic file replacement 寫入 `MIYA_DATA_DIR`；restart recovery 採 at-least-once 語意，因此 crash 時仍在飛的單項模型請求可能被重新執行，但已完成的 output/error file 不會被回報成部分完成檔案。
+
+In practice:
 
 - if a frontend asks for "OpenAI API URL" or "endpoint", use `http://localhost:3100/v1`;
 - if a frontend asks for "base URL" and appends `/v1` internally, use `http://localhost:3100`.
+
+### Shared API Key
+
+Miya 使用單一 deployment-wide shared key，不要求每位使用者各自提供 key。設定 `MIYA_API_KEY` 後：
+
+- OpenAI SDK 使用相同 key 作為 `Authorization: Bearer ...`；
+- Anthropic SDK 使用相同 key 作為 `x-api-key: ...`；
+- `/health` 保持公開，其他 API 路徑要求 shared key；
+- `tenant_id` 仍用於工作區、context 與 telemetry 隔離，不會被解讀成獨立 credential。
+
+```python
+from openai import OpenAI
+from anthropic import Anthropic
+
+openai_client = OpenAI(base_url="http://127.0.0.1:3100/v1", api_key="miya-local-key")
+anthropic_client = Anthropic(base_url="http://127.0.0.1:3100", api_key="miya-local-key")
+```
+
+若未設定 `MIYA_API_KEY`，為維持本機開發相容性，shared-key 驗證不會啟用。Windows launcher 預設提供共同 key `miya-local-key`，部署到其他主機時應改成自己的 deployment key。
 
 Supported request features:
 
 - `messages`
 - string content and content-part arrays
 - `image_url` with remote URL or `data:*;base64,...`
+- OpenAI `input_audio` and `file` content parts, including Responses `input_file` conversion
 - `tools`
 - `tool_choice`
 - legacy `functions`
@@ -157,18 +189,19 @@ Supported Responses features:
 
 - string `input`
 - message input items
-- input content parts: `input_text`, `text`, `input_image`, `image_url`
+- input content parts: `input_text`, `text`, `input_image`, `image_url`, `input_audio`, `input_file`, `file`
 - output/tool history items: `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `local_shell_call`, `shell_call`, `apply_patch_call`, and matching output items
 - `instructions`
 - `tools`, including Responses-style top-level function tools and OpenAI Chat-style `function` tools
 - `tool_choice`
 - `parallel_tool_calls`
 - `stream`
+- durable `background=true` execution, polling, and actual in-flight cancellation
 - `store`
 - `previous_response_id`
 - `metadata` tenant/request/conversation isolation
 - `reasoning_effort`, `reasoning.effort`, and effort-suffixed model aliases
-- `max_output_tokens`, `temperature`, `top_p`, `top_logprobs`, `text.response_format`, and backend-specific extra model options
+- `max_output_tokens`, `temperature`, `top_p`, `top_logprobs`, `service_tier`, `safety_identifier`, prompt-cache options, `text.response_format`, `text.verbosity`, and backend-specific extra model options
 
 Stored Responses are tenant-scoped and backed by SurrealKV when `CONTEXT_STORE_PATH` is configured, with an in-memory mirror for fast local reads. `previous_response_id` reloads the stored conversation messages for the same tenant only, so different tenants cannot continue or retrieve each other's response chains.
 
@@ -188,7 +221,7 @@ response.completed
 data: [DONE]
 ```
 
-`GET /v1/responses/{response_id}` retrieves a stored response, `GET /v1/responses/{response_id}/input_items` returns the original input items, and `DELETE /v1/responses/{response_id}` removes tenant-scoped stored state. `POST /v1/responses/input_tokens` provides a local token estimate for frontend budgeting. `POST /v1/responses/compact` returns a compacted artifact envelope suitable for clients expecting the endpoint; semantic model-driven compaction is intentionally kept separate from this compatibility response.
+`GET /v1/responses/{response_id}` retrieves a stored response, `GET /v1/responses/{response_id}/input_items` returns the original input items, and `DELETE /v1/responses/{response_id}` removes tenant-scoped stored state. `background=true` 會立即建立 `queued` response，durable worker 隨後更新為 `in_progress`／`completed`／`failed`；`POST /v1/responses/{response_id}/cancel` 會持久化取消意圖並中止目前 execution future。`POST /v1/responses/input_tokens` provides a local token estimate for frontend budgeting. `POST /v1/responses/compact` returns a compacted artifact envelope suitable for clients expecting the endpoint; semantic model-driven compaction is intentionally kept separate from this compatibility response. `conversation`、prompt templates 與自動 truncation 仍會明確回傳 `400`，不會被靜默忽略。
 
 Legacy OpenAI Completions compatibility:
 
@@ -203,9 +236,15 @@ Legacy OpenAI Completions compatibility:
 POST /messages
 POST /v1/messages
 POST /v1/v1/messages
-POST /messages/batch
-POST /v1/messages/batch
-POST /v1/v1/messages/batch
+POST /messages/count_tokens
+POST /v1/messages/count_tokens
+POST /v1/v1/messages/count_tokens
+POST /v1/messages/batches
+GET  /v1/messages/batches
+GET  /v1/messages/batches/{message_batch_id}
+POST /v1/messages/batches/{message_batch_id}/cancel
+DELETE /v1/messages/batches/{message_batch_id}
+GET  /v1/messages/batches/{message_batch_id}/results
 ```
 
 Supported request features:
@@ -216,6 +255,9 @@ Supported request features:
 - content block arrays
 - image blocks with base64 source
 - image blocks with URL source
+- document and search-result blocks
+- citation-bearing text blocks
+- server-tool use/result, code execution, web fetch/search, tool search, container upload, thinking, and other current provider-native content blocks
 - `tools`
 - `tool_choice`
 - `tool_use` history
@@ -226,11 +268,13 @@ Supported request features:
 - `metadata`
 - provider model options such as `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences`, `metadata`, service-tier/provider beta fields, and backend-specific extra fields
 
-Batch endpoints run items concurrently and preserve per-item response isolation. Batch size is capped at 64 requests.
+`POST /v1/messages/count_tokens` 提供符合目前 Anthropic SDK `MessageTokensCount` shape 的本機估算，包含 system、messages、tools 與 image block 基準成本。它不是 provider tokenizer 的精確 billing 值。
+
+舊有同步 `/messages/batch` aliases 已移除。`/v1/messages/batches` 現在使用官方 `{custom_id, params}` contract，建立後立即非同步執行；retrieve/list/cancel/delete 及 `results_url` JSONL 下載均可由目前 Anthropic SDK 使用。Batch metadata、輸入 payload、結果與取消狀態會寫入 durable store，server restart 後會重新排程未完成工作。
 
 ## Provider Parameter Pass-Through
 
-Miya API only consumes gateway/orchestration parameters. Model configuration parameters are preserved and forwarded to the configured backend provider so existing OpenAI Chat Completions and Anthropic Messages frontends keep working.
+Miya API only consumes gateway/orchestration parameters. Model configuration parameters are preserved and forwarded to the configured backend provider so existing OpenAI Chat Completions and Anthropic Messages frontends keep working. 本次相容性基準參考 `openai-python 2.52.0` 與 `anthropic 0.120.2`。Public synthesizer 與 root-visible tool continuation 會保留呼叫者的 output cap 與 stop conditions；只有 planner、worker 與 reasoning-summary 等內部呼叫使用獨立的 internal generation floor。
 
 Gateway-consumed parameters:
 
@@ -339,9 +383,9 @@ The same identity can also be supplied per request through `metadata`, which is 
 }
 ```
 
-`metadata` overrides headers, headers override the default tenant `default`. Unsafe or very long identity values are internally hashed into bounded ASCII components, so user-facing IDs can be accepted without becoming storage-key material. Batch items are normalized independently, so one batch may safely contain requests for multiple tenants.
+`metadata` overrides headers, headers override the default tenant `default`. Unsafe or very long identity values are internally hashed into bounded ASCII components, so user-facing IDs can be accepted without becoming storage-key material. 自訂 Anthropic batch 擴充會逐項獨立正規化，因此同一個 batch 可安全包含不同 tenant 的 requests。
 
-Production routers also apply a per-tenant concurrency limiter. `TENANT_MAX_CONCURRENT_REQUESTS` defaults to the medium tier, `16`, when the router is built from environment variables. Set it to `0` to disable the limiter. Requests beyond the same tenant's limit wait on that tenant's semaphore; other tenants continue running independently. This keeps one tenant's large batch or high-effort workload from monopolizing provider capacity.
+Production routers also apply a per-tenant concurrency limiter. `TENANT_MAX_CONCURRENT_REQUESTS` defaults to the medium tier, `16`, when the router is built from environment variables. Set it to `0` to disable the limiter. Requests beyond the same tenant's limit wait on that tenant's semaphore; other tenants continue running independently. This keeps one tenant's large Anthropic batch extension call or high-effort workload from monopolizing provider capacity.
 
 ## Reasoning Effort
 
@@ -358,8 +402,15 @@ Production routers also apply a per-tenant concurrency limiter. `TENANT_MAX_CONC
 Concurrency can be configured globally through environment variables:
 
 ```bash
-MULTI_AGENT_MAX_PARALLEL_AGENTS=4 cargo run -p api-server
+MULTI_AGENT_MAX_PARALLEL_AGENTS=4 \
+MIYA_PROVIDER_MAX_CONCURRENT=64 \
+MIYA_PROVIDER_QUEUE_TIMEOUT_MS=30000 \
+MIYA_REQUEST_TIMEOUT_MS=60000 \
+MIYA_AGENT_TIMEOUT_MS=20000 \
+cargo run -p api-server
 ```
+
+`MULTI_AGENT_MAX_PARALLEL_AGENTS` 限制單一 orchestration 的 child fan-out；`MIYA_PROVIDER_MAX_CONCURRENT` 是跨 request、跨 tenant、同時涵蓋 kernel 與 direct passthrough 的 process-wide provider admission limit。排隊超時回傳 `503`，agent/request 執行超時回傳 `504`。
 
 The same limit can be overridden per request:
 
@@ -700,6 +751,7 @@ Run against an OpenAI-compatible backend:
 MULTI_AGENT_PROVIDER=openai \
 OPENAI_BASE_URL=http://localhost:8000/v1 \
 OPENAI_API_KEY=local-key \
+MIYA_API_KEY=miya-local-key \
 cargo run -p api-server
 ```
 
@@ -710,6 +762,7 @@ Windows deployment for a local Gemma-format fine-tune:
   -BindAddr "127.0.0.1:3100" `
   -OpenAIBaseUrl "http://YOUR_BACKEND_HOST:PORT/v1" `
   -OpenAIApiKey "local-key" `
+  -MiyaApiKey "miya-local-key" `
   -DefaultModel "local-gemma-model" `
   -GemmaModels "local-gemma-model" `
   -TenantMaxConcurrentRequests 16 `
@@ -725,6 +778,7 @@ Windows deployment for a local OpenAI-compatible Qwen backend:
   -BindAddr "127.0.0.1:3100" `
   -OpenAIBaseUrl "http://localhost:8000/v1" `
   -OpenAIApiKey "local-key" `
+  -MiyaApiKey "miya-local-key" `
   -DefaultModel "local-qwen-model" `
   -TenantMaxConcurrentRequests 16 `
   -MaxParallelAgents 4 `
@@ -739,7 +793,8 @@ Smoke test:
 ```powershell
 .\scripts\windows\smoke-miya-api.ps1 `
   -BaseUrl "http://127.0.0.1:3100" `
-  -Model "local-qwen-model"
+  -Model "local-qwen-model" `
+  -MiyaApiKey "miya-local-key"
 ```
 
 On this Windows deployment the launcher defaults to `127.0.0.1:3100` because port `3000` is commonly occupied by Docker/WSL relay processes. Use `http://localhost:3100/v1` or `http://127.0.0.1:3100/v1` in OpenAI Chat Completions clients.
@@ -762,6 +817,7 @@ Invoke one CLI request and print its matching backend telemetry:
 .\scripts\windows\invoke-miya-api.ps1 `
   -BaseUrl "http://localhost:3100" `
   -Model "local-qwen-model" `
+  -MiyaApiKey "miya-local-key" `
   -Effort low `
   -MaxParallelAgents 4 `
   -Message "OK"
@@ -798,7 +854,21 @@ The Windows launcher sets:
 MULTI_AGENT_PROVIDER=openai
 OPENAI_BASE_URL=http://YOUR_BACKEND_HOST:PORT/v1
 OPENAI_API_KEY=local-key
+MIYA_API_KEY=miya-local-key
 TENANT_MAX_CONCURRENT_REQUESTS=16
+MIYA_PROVIDER_MAX_CONCURRENT=64
+MIYA_PROVIDER_QUEUE_TIMEOUT_MS=30000
+MIYA_PROVIDER_MAX_RETRIES=2
+MIYA_PROVIDER_RETRY_BASE_MS=250
+MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD=5
+MIYA_PROVIDER_CIRCUIT_COOLDOWN_MS=30000
+MIYA_REQUEST_TIMEOUT_MS=60000
+MIYA_AGENT_TIMEOUT_MS=20000
+MIYA_DATA_DIR=.multi-agent-data
+MIYA_MAX_CONCURRENT_JOBS=4
+MIYA_BATCH_ITEM_CONCURRENCY=8
+MIYA_SEMANTIC_VERIFIER=true
+MIYA_SEMANTIC_MAX_REPAIR_ATTEMPTS=2
 MULTI_AGENT_MAX_PARALLEL_AGENTS=4
 MULTI_AGENT_MODELS=local-model,mock
 MIYA_GEMMA_MODELS=local-gemma-model
@@ -824,6 +894,7 @@ MULTI_AGENT_PROVIDER=anthropic \
 ANTHROPIC_BASE_URL=http://localhost:8000 \
 ANTHROPIC_API_KEY=local-key \
 ANTHROPIC_VERSION=2023-06-01 \
+MIYA_API_KEY=miya-local-key \
 cargo run -p api-server
 ```
 
@@ -833,7 +904,8 @@ cargo run -p api-server
 | --- | --- | --- |
 | `BIND_ADDR` | `127.0.0.1:3000` | API server bind address |
 | `MULTI_AGENT_PROVIDER` | `mock` | `mock`, `openai`, or `anthropic` |
-| `OPENAI_API_KEY` | required for OpenAI provider | bearer token |
+| `MIYA_API_KEY` | disabled when unset | one deployment-wide shared client key; accepted as OpenAI Bearer or Anthropic `x-api-key`; alias: `MIYA_SHARED_API_KEY` |
+| `OPENAI_API_KEY` | required for OpenAI provider | upstream provider bearer token; independent from `MIYA_API_KEY` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `ANTHROPIC_API_KEY` | required for Anthropic provider | `x-api-key` value |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic-compatible base URL |
@@ -842,7 +914,25 @@ cargo run -p api-server
 | `CONTEXT_STORE_PATH` | `.multi-agent-context/surrealkv` | SurrealKV storage path |
 | `TENANT_MAX_CONCURRENT_REQUESTS` | `16` in env-built router | per-tenant concurrency cap; `0` disables |
 | `MULTI_AGENT_MAX_PARALLEL_AGENTS` | `4` | max concurrent child-agent provider calls; aliases: `MIYA_MAX_PARALLEL_AGENTS`, `MAX_PARALLEL_AGENTS` |
+| `MIYA_PROVIDER_MAX_CONCURRENT` | `64` | process-wide concurrent provider call limit shared by all tenants and direct/kernel paths; `0` disables |
+| `MIYA_PROVIDER_QUEUE_TIMEOUT_MS` | `30000` | maximum wait for a process-wide provider permit |
+| `MIYA_PROVIDER_MAX_RETRIES` | `2` | retries after the initial attempt for retryable transport, 408/409/429, and 5xx failures; applies to kernel, direct, streaming setup, and batch paths |
+| `MIYA_PROVIDER_RETRY_BASE_MS` | `250` | exponential retry base delay; provider `Retry-After` takes precedence |
+| `MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD` | `5` | terminal retryable failures before opening the process-wide provider circuit |
+| `MIYA_PROVIDER_CIRCUIT_COOLDOWN_MS` | `30000` | circuit-open cooldown before one half-open probe |
+| `MIYA_REQUEST_TIMEOUT_MS` | `60000` | total kernel request timeout |
+| `MIYA_AGENT_TIMEOUT_MS` | `20000` | timeout for each planner/worker/root/synthesizer call |
+| `MIYA_PROVIDER_TIMEOUT_SECS` | `300` | HTTP request timeout for provider adapters and direct passthrough |
+| `MIYA_PROVIDER_CONNECT_TIMEOUT_SECS` | `30` | provider connect timeout |
+| `MIYA_DATA_DIR` | `.multi-agent-data` | durable object/blob root for files, batches, Message Batches, background Response payloads, and fallback response state |
+| `MIYA_MAX_CONCURRENT_JOBS` | `4` | concurrent durable jobs; does not reduce each request's agent coverage |
+| `MIYA_BATCH_ITEM_CONCURRENCY` | `8` | requests concurrently dispatched inside one batch, still bounded by tenant/provider admission |
+| `MIYA_SEMANTIC_VERIFIER` | `true` in env-built router | enables independent semantic verification after multi-agent synthesis; direct `reasoning.effort=none` remains direct |
+| `MIYA_SEMANTIC_MAX_REPAIR_ATTEMPTS` | `2` | maximum repair-and-recheck iterations after a failed semantic verdict |
 | `MIYA_PUBLIC_REASONING` | `always` | public multi-agent reasoning summary policy: `always`, `request`, `never`/`strip`; aliases: `MIYA_PUBLIC_REASONING_MODE`, `MULTI_AGENT_PUBLIC_REASONING`, `PUBLIC_REASONING_MODE` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | disabled when unset | enables OTLP/gRPC OpenTelemetry span export; W3C `traceparent` propagation and local tracing remain available |
+| `MIYA_OTEL_ENABLED` | `false` | force OTLP initialization when exporter configuration is supplied through standard OTEL variables |
+| `RUST_LOG` | `info` | tracing filter for local and OTLP spans |
 | `TRAINING_TRACE` | disabled | set to `enabled`, `true`, or `1` to append training samples |
 | `TRAINING_TRACE_PATH` | `logs/training-traces.jsonl` | JSONL training sample output path |
 
@@ -871,13 +961,13 @@ Anthropic-compatible responses include:
 }
 ```
 
-The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`.
+The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`. `GET /metrics` exposes Prometheus counters for provider attempts/retries/failures/circuit rejections and durable job start/finish/cancellation. HTTP requests accept W3C `traceparent`; setting `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP/gRPC export.
 
 Telemetry fields include `route`, `model`, `tenant_id`, `request_id`, `conversation_fingerprint`, `reasoning_effort`, `stream`, `batch_index`, `direct_passthrough`, `input_tokens`, `output_tokens`, `total_tokens`, `provider_call_count`, `task_count`, `child_agent_count`, `tool_call_count`, `verification`, and optional context-cache details.
 
 For CLI correlation, send `x-request-id`; the gateway uses that ID in telemetry. The Windows `invoke-miya-api.ps1` script generates one automatically, sends the request, then prints the matching telemetry row from the JSONL log.
 
-Telemetry deliberately does not log raw prompts, final answer text, child-agent artifacts, child-agent tool calls, or hidden thinking. Root provider streaming paths record token usage when the upstream stream exposes a usage event; non-streaming paths use provider response usage directly.
+Telemetry deliberately does not log raw prompts, final answer text, child-agent artifacts, child-agent tool calls, or hidden thinking. Root provider streaming paths record token usage when the upstream stream exposes a usage event; non-streaming paths use provider response usage directly. Upstream HTTP failures retain provider, status, code, message and retry timing internally; public compatibility errors preserve 429/client status where appropriate and map transport/invalid-response/circuit/admission failures to explicit gateway errors.
 
 ## Training Trace Recording
 
@@ -1044,25 +1134,6 @@ curl http://127.0.0.1:3000/v1/messages \
   }'
 ```
 
-### Batch
-
-```bash
-curl http://127.0.0.1:3000/v1/chat/completions/batch \
-  -H "content-type: application/json" \
-  -d '{
-    "requests": [
-      {
-        "model": "mock",
-        "messages": [{ "role": "user", "content": "first" }]
-      },
-      {
-        "model": "mock",
-        "messages": [{ "role": "user", "content": "second" }]
-      }
-    ]
-  }'
-```
-
 ## Provider Contract
 
 Provider adapters implement:
@@ -1132,13 +1203,18 @@ The current test suite covers:
 - encrypted sub-agent state
 - OpenAI request normalization
 - Anthropic request normalization
-- image input normalization
+- image/audio/file/document/citation/server-tool content normalization and provider preservation
 - tool call and tool result compatibility
 - legacy OpenAI function compatibility
 - OpenAI and Anthropic route responses
 - response usage mapping and backend usage telemetry
 - SSE formatting and upstream SSE parsing
-- batch concurrency and response isolation
+- official OpenAI multipart Files + asynchronous Batch JSONL lifecycle
+- official Anthropic Message Batches create/retrieve/list/cancel/delete/results lifecycle
+- durable filesystem reopen and unfinished-job recovery primitives
+- Responses background polling and in-flight cancellation
+- structured provider errors, 429 retry, circuit-breaker metrics, Prometheus rendering
+- semantic verifier artifact coverage and bounded repair/recheck
 - SurrealKV context rewind
 - context-pack cache reuse
 - model-planned high-effort coverage improvement

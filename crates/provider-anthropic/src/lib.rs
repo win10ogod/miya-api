@@ -234,12 +234,19 @@ impl ModelProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?
+            .map_err(|error| ProviderError::Transport {
+                provider: "anthropic".to_string(),
+                message: error.to_string(),
+                retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+            })?;
+        let value = anthropic_json_or_error(value)
+            .await?
             .json::<serde_json::Value>()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+            .map_err(|error| ProviderError::InvalidResponse {
+                provider: "anthropic".to_string(),
+                message: error.to_string(),
+            })?;
 
         Self::parse_response(&scope, &task_id, value)
     }
@@ -254,12 +261,52 @@ impl ModelProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| ProviderError::Rejected(error.to_string()))?;
+            .map_err(|error| ProviderError::Transport {
+                provider: "anthropic".to_string(),
+                message: error.to_string(),
+                retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+            })?;
+        let response = anthropic_json_or_error(response).await?;
 
         Ok(anthropic_sse_provider_stream(response))
     }
+}
+
+async fn anthropic_json_or_error(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, ProviderError> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status().as_u16();
+    let retry_after_ms = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000));
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let error = value.as_ref().and_then(|value| value.get("error"));
+    let code = error
+        .and_then(|error| error.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or(body);
+    Err(ProviderError::Http {
+        provider: "anthropic".to_string(),
+        status,
+        code,
+        message,
+        retry_after_ms,
+    })
 }
 
 type UpstreamByteStream =
@@ -569,6 +616,10 @@ fn anthropic_content_block(
             .iter()
             .find(|media| media.id == artifact_ref.artifact_id)
             .map(anthropic_media_block),
+        NormalizedContentPart::ProviderContent {
+            source_format,
+            value,
+        } => Some(anthropic_provider_content(source_format, value)),
         NormalizedContentPart::ToolCall {
             tool_call_id,
             tool_name,
@@ -585,6 +636,26 @@ fn anthropic_content_block(
             "content": tool_result_json(tool_call_id, request)
         })),
     }
+}
+
+fn anthropic_provider_content(
+    source_format: &SourceFormat,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    if source_format == &SourceFormat::AnthropicMessages {
+        return value.clone();
+    }
+    if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+        return serde_json::json!({"type": "text", "text": text});
+    }
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("provider_content");
+    serde_json::json!({
+        "type": "text",
+        "text": format!("[{kind} content preserved from OpenAI input] {}", value)
+    })
 }
 
 fn anthropic_role(role: &MessageRole) -> &'static str {

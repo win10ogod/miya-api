@@ -8,10 +8,14 @@ version.workspace = true
 agent-kernel.workspace = true
 agent-protocol.workspace = true
 async-trait.workspace = true
-axum = { workspace = true, features = ["ws"] }
+axum = { workspace = true, features = ["multipart", "ws"] }
+chrono.workspace = true
 context-store.workspace = true
 futures.workspace = true
 hex.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 provider-anthropic.workspace = true
 provider-core.workspace = true
 provider-openai.workspace = true
@@ -21,7 +25,11 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tower.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
