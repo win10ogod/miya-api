@@ -17,6 +17,7 @@ use serde_json::json;
 use thiserror::Error;
 
 const MAX_ORCHESTRATION_REPAIR_ATTEMPTS: usize = 3;
+const MAX_EMPTY_SYNTHESIS_RETRY_ATTEMPTS: usize = 2;
 const DEFAULT_MAX_SEMANTIC_REPAIR_ATTEMPTS: u8 = 2;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -606,6 +607,21 @@ where
                     repair_attempts += 1;
                 }
                 if should_repair_orchestration_plan(&plan_coverage, &request_policy) {
+                    let added = reconcile_under_target_orchestration_plan(
+                        &mut planner_response,
+                        &request_policy,
+                    );
+                    if added > 0 {
+                        plan_coverage = planner_coverage(&planner_response);
+                        planning_issue = Some(VerificationIssue {
+                            code: "orchestration_plan_reconciled".to_string(),
+                            message: format!(
+                                "model remained below the configured child-agent count after {MAX_ORCHESTRATION_REPAIR_ATTEMPTS} repairs; added {added} bounded independent cross-check agent(s) from model-selected objectives"
+                            ),
+                        });
+                    }
+                }
+                if should_repair_orchestration_plan(&plan_coverage, &request_policy) {
                     return Err(KernelError::ProviderRejected(format!(
                         "model orchestration returned {} child agent(s); reasoning effort {} requires exactly {} child agent(s); refusing root-only fallback",
                         plan_coverage.child_count,
@@ -867,6 +883,7 @@ where
             trace_events.extend(trace_events_from_response(&summary_task, &summary_response));
         }
 
+        let mut synthesis_issue = None;
         let final_text = if root_unresolved.is_empty() && !root_continuation_artifacts.is_empty() {
             synthesize_text(&root_continuation_artifacts)
         } else if root_unresolved.is_empty() && has_child_tasks {
@@ -886,30 +903,73 @@ where
                 },
             };
             graph.insert_task(synth_task.clone());
-            let synth_input = synthesis_input(&request, &text_artifacts);
-            trace_events.push(trace_agent_input(&synth_task, synth_input.clone()));
-            let synth_response = self
-                .invoke_provider(ProviderRequest {
-                    scope: scope.clone(),
-                    task: synth_task.clone(),
-                    model: request.model.clone(),
-                    system_instructions: system_instructions.clone(),
-                    thinking_enabled: request.thinking_enabled,
-                    thinking_format: request.thinking_format.clone(),
-                    input_text: synth_input,
-                    messages: Vec::new(),
-                    media_artifacts: request.media_artifacts.clone(),
-                    artifacts: Vec::new(),
-                    tools: Vec::new(),
-                    tool_choice: ToolChoice::None,
-                    parallel_tool_calls: None,
-                    tool_results: Vec::new(),
-                    provider_options: request.provider_options.clone(),
-                })
-                .await?;
-            accumulate_usage(&mut usage, &mut provider_call_count, &synth_response);
-            trace_events.extend(trace_events_from_response(&synth_task, &synth_response));
-            synthesize_text(&synth_response.artifacts)
+            let base_synth_input = synthesis_input(&request, &text_artifacts);
+            let mut synthesis_attempt = 0_usize;
+            let final_text = loop {
+                let attempt_task = if synthesis_attempt == 0 {
+                    synth_task.clone()
+                } else {
+                    let task = SubtaskSpec {
+                        task_id: TaskId::from(format!(
+                            "synthesizer-empty-retry-{synthesis_attempt}"
+                        )),
+                        objective: "retry final synthesis after an empty model completion while preserving every user constraint".to_string(),
+                        ..synth_task.clone()
+                    };
+                    graph.insert_task(task.clone());
+                    task
+                };
+                let synth_input = if synthesis_attempt == 0 {
+                    base_synth_input.clone()
+                } else {
+                    empty_synthesis_retry_input(&base_synth_input, synthesis_attempt)
+                };
+                trace_events.push(trace_agent_input(&attempt_task, synth_input.clone()));
+                let synth_response = self
+                    .invoke_provider(ProviderRequest {
+                        scope: scope.clone(),
+                        task: attempt_task.clone(),
+                        model: request.model.clone(),
+                        system_instructions: system_instructions.clone(),
+                        thinking_enabled: request.thinking_enabled,
+                        thinking_format: request.thinking_format.clone(),
+                        input_text: synth_input,
+                        messages: Vec::new(),
+                        media_artifacts: request.media_artifacts.clone(),
+                        artifacts: Vec::new(),
+                        tools: Vec::new(),
+                        tool_choice: ToolChoice::None,
+                        parallel_tool_calls: None,
+                        tool_results: Vec::new(),
+                        provider_options: request.provider_options.clone(),
+                    })
+                    .await?;
+                accumulate_usage(&mut usage, &mut provider_call_count, &synth_response);
+                trace_events.extend(trace_events_from_response(&attempt_task, &synth_response));
+                let synthesized = synthesize_text(&synth_response.artifacts);
+                if !synthesized.trim().is_empty() {
+                    break synthesized;
+                }
+                if synthesis_attempt >= MAX_EMPTY_SYNTHESIS_RETRY_ATTEMPTS {
+                    return Err(KernelError::Provider(ProviderError::InvalidResponse {
+                        provider: "orchestration_synthesizer".to_string(),
+                        message: format!(
+                            "model returned no final text after {} synthesis attempts",
+                            synthesis_attempt + 1
+                        ),
+                    }));
+                }
+                synthesis_attempt = synthesis_attempt.saturating_add(1);
+            };
+            if synthesis_attempt > 0 {
+                synthesis_issue = Some(VerificationIssue {
+                    code: "empty_synthesis_recovered".to_string(),
+                    message: format!(
+                        "final synthesis produced text after {synthesis_attempt} bounded empty-completion retry attempt(s) with unchanged model settings"
+                    ),
+                });
+            }
+            final_text
         } else if root_unresolved.is_empty() {
             synthesize_text(&text_artifacts)
         } else {
@@ -964,10 +1024,18 @@ where
         if let Some(issue) = planning_issue {
             issues.push(issue);
         }
+        if let Some(issue) = synthesis_issue {
+            issues.push(issue);
+        }
         let passed = semantic_verification.passed
-            && !issues
-                .iter()
-                .any(|issue| issue.code != "missing_model_spawn_plan");
+            && !issues.iter().any(|issue| {
+                !matches!(
+                    issue.code.as_str(),
+                    "missing_model_spawn_plan"
+                        | "orchestration_plan_reconciled"
+                        | "empty_synthesis_recovered"
+                )
+            });
         let verification = VerificationReport {
             request_id: request.request_id.clone(),
             passed,
@@ -1806,7 +1874,7 @@ fn is_state_handle_field(name: &str) -> bool {
 fn orchestration_policy_instruction(effort: &ReasoningEffort, policy: &KernelPolicy) -> String {
     let max_agents = policy.limits.max_agents_per_request;
     format!(
-        "Orchestration policy: reasoning_effort={}; max_agents_per_request={max_agents}; max_parallel_agents={}; target_parallel_agents={max_agents}; max_spawn_depth={}; max_total_tool_calls={}; token_accounting_reference={}. Multi-agent decomposition must be model-selected from the actual task context, not a generic template. For non-direct reasoning, target_parallel_agents is the required child-agent count; empty or under-target spawn plans are rejected instead of falling back to root-only execution. max_parallel_agents is only the concurrent backend request limit, not the child-agent count. Token accounting is telemetry only and must not suppress child-agent execution or reduce final answer quality. Low should stay compact; medium/high/xhigh should broaden coverage and verification. Only root-visible tool calls and the final synthesis are public.",
+        "Orchestration policy: reasoning_effort={}; max_agents_per_request={max_agents}; max_parallel_agents={}; target_parallel_agents={max_agents}; max_spawn_depth={}; max_total_tool_calls={}; token_accounting_reference={}. Multi-agent decomposition must be model-selected from the actual task context, not a generic template. For non-direct reasoning, target_parallel_agents is the required child-agent count; under-target plans receive bounded model repair and, only after repairs remain short, independent cross-check agents derived from model-selected objectives instead of a root-only fallback. max_parallel_agents is only the concurrent backend request limit, not the child-agent count. Token accounting is telemetry only and must not suppress child-agent execution or reduce final answer quality. Low should stay compact; medium/high/xhigh should broaden coverage and verification. Only root-visible tool calls and the final synthesis are public.",
         reasoning_effort_name(effort),
         policy.limits.max_parallel_agents,
         policy.limits.max_spawn_depth,
@@ -1982,6 +2050,67 @@ fn normalize_over_target_orchestration_plans(
             remaining = remaining.saturating_sub(plan.children.len());
         }
     }
+}
+
+fn reconcile_under_target_orchestration_plan(
+    response: &mut ProviderResponse,
+    policy: &KernelPolicy,
+) -> usize {
+    let target = usize::from(policy.limits.max_agents_per_request);
+    let current = planner_coverage(response).child_count;
+    if current == 0 || current >= target {
+        return 0;
+    }
+
+    let templates = response
+        .artifacts
+        .iter()
+        .filter_map(|artifact| match artifact {
+            AgentArtifact::SpawnPlan { plan, .. } => Some(plan.children.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    if templates.is_empty() {
+        return 0;
+    }
+    let mut task_ids = templates
+        .iter()
+        .map(|child| child.task_id.as_ref().to_string())
+        .collect::<BTreeSet<_>>();
+    let Some(destination) = response
+        .artifacts
+        .iter_mut()
+        .find_map(|artifact| match artifact {
+            AgentArtifact::SpawnPlan { plan, .. } => Some(plan),
+            _ => None,
+        })
+    else {
+        return 0;
+    };
+
+    let missing = target.saturating_sub(current);
+    for offset in 0..missing {
+        let template = &templates[offset % templates.len()];
+        let mut suffix = current.saturating_add(offset).saturating_add(1);
+        let task_id = loop {
+            let candidate = format!(
+                "{}-independent-crosscheck-{suffix:02}",
+                template.task_id.as_ref()
+            );
+            if task_ids.insert(candidate.clone()) {
+                break candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        };
+        let mut child = template.clone();
+        child.task_id = TaskId::from(task_id);
+        child.parent_task_id = Some(destination.parent_task_id.clone());
+        child.objective = format!("Independently cross-check: {}", template.objective);
+        destination.children.push(child);
+    }
+    missing
 }
 
 fn should_repair_orchestration_plan(coverage: &PlannerCoverage, policy: &KernelPolicy) -> bool {
@@ -2226,6 +2355,12 @@ fn child_agent_input(request: &NormalizedRequest, task: &SubtaskSpec) -> String 
 fn synthesis_input(request: &NormalizedRequest, artifacts: &[AgentArtifact]) -> String {
     let artifact_text = synthesize_text(artifacts);
     synthesis_input_from_findings(request, &artifact_text)
+}
+
+fn empty_synthesis_retry_input(base_input: &str, attempt: usize) -> String {
+    format!(
+        "{base_input}\n\nThe previous final-synthesis completion returned no final text. Retry {attempt}/{MAX_EMPTY_SYNTHESIS_RETRY_ATTEMPTS}: produce a non-empty final answer now while preserving the exact same model settings, output limit, reasoning mode, evidence, and user constraints. Do not discuss this retry or expose hidden reasoning."
+    )
 }
 
 fn root_tool_continuation_input(
@@ -2774,6 +2909,49 @@ mod tests {
     }
 
     #[test]
+    fn under_target_xhigh_plan_is_reconciled_to_sixty_four_agents() {
+        let scope = IsolationKey::new("tenant", "request-a", "conversation");
+        let mut response = ProviderResponse {
+            artifacts: vec![AgentArtifact::SpawnPlan {
+                id: ArtifactId::from("under-target-xhigh-plan"),
+                scope,
+                plan: SpawnPlan {
+                    parent_task_id: TaskId::from("root"),
+                    reason: "model returned sixty-three children".to_string(),
+                    children: model_children("xhigh", 63, "coverage slice"),
+                    expected_artifacts: vec![ArtifactKind::Text],
+                    budget_request: BudgetRequest {
+                        max_tokens: 8192,
+                        max_tool_calls: 0,
+                    },
+                },
+            }],
+            tool_calls: vec![],
+            usage: ProviderUsage::default(),
+        };
+        let policy = KernelPolicy::default().with_reasoning_effort(&ReasoningEffort::XHigh);
+
+        let added = reconcile_under_target_orchestration_plan(&mut response, &policy);
+
+        assert_eq!(added, 1);
+        assert_eq!(planner_coverage(&response).child_count, 64);
+        let AgentArtifact::SpawnPlan { plan, .. } = &response.artifacts[0] else {
+            panic!("expected spawn plan");
+        };
+        assert!(
+            plan.children[63]
+                .objective
+                .starts_with("Independently cross-check:")
+        );
+        assert!(
+            plan.children[63]
+                .task_id
+                .as_ref()
+                .contains("independent-crosscheck")
+        );
+    }
+
+    #[test]
     fn text_only_worker_cannot_add_an_accidental_extra_agent() {
         let scope = IsolationKey::new("tenant", "request-a", "conversation");
         let root = TaskId::from("root");
@@ -3243,6 +3421,82 @@ mod tests {
                 .count(),
             32
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_63_child_xhigh_plan_completes_with_64_agents_after_bounded_repairs() {
+        let mut request = text_request("exercise all xhigh coverage slices");
+        request.reasoning_effort = ReasoningEffort::XHigh;
+        let provider = PersistentUnderTargetPlannerProvider::default();
+        let planner_calls = provider.planner_calls.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert_eq!(planner_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(output.encrypted_subagent_state.len(), 64);
+        assert!(output.verification.passed);
+        assert!(output.verification.issues.iter().any(|issue| {
+            issue.code == "orchestration_plan_reconciled"
+                && issue
+                    .message
+                    .contains("added 1 bounded independent cross-check")
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_xhigh_synthesis_retries_with_identical_reasoning_and_output_options() {
+        let mut request = text_request("return a non-empty xhigh final answer");
+        request.reasoning_effort = ReasoningEffort::XHigh;
+        request.thinking_enabled = true;
+        request.provider_options = serde_json::json!({
+            "max_completion_tokens": 512,
+            "temperature": 0.3
+        });
+        let provider = EmptySynthesisProvider::succeed_on(2);
+        let synth_calls = provider.synth_calls.clone();
+        let synthesis_settings = provider.synthesis_settings.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert_eq!(output.encrypted_subagent_state.len(), 64);
+        assert_eq!(output.final_text, "XHIGH_NON_EMPTY_OK");
+        assert!(output.verification.passed);
+        assert!(
+            output
+                .verification
+                .issues
+                .iter()
+                .any(|issue| issue.code == "empty_synthesis_recovered")
+        );
+        assert_eq!(synth_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let settings = synthesis_settings.lock().unwrap();
+        assert_eq!(settings.len(), 2);
+        assert!(settings.iter().all(|(thinking_enabled, options)| {
+            *thinking_enabled
+                && options["max_completion_tokens"] == 512
+                && options["temperature"] == 0.3
+        }));
+    }
+
+    #[tokio::test]
+    async fn persistently_empty_synthesis_returns_structured_upstream_error_not_empty_success() {
+        let mut request = text_request("never return an empty successful response");
+        request.reasoning_effort = ReasoningEffort::Low;
+        let provider = EmptySynthesisProvider::never_succeeds();
+        let synth_calls = provider.synth_calls.clone();
+        let runner = KernelRunner::new(provider, KernelPolicy::default());
+
+        let error = runner.run(request).await.unwrap_err();
+
+        assert_eq!(synth_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(matches!(
+            error,
+            KernelError::Provider(ProviderError::InvalidResponse { provider, message })
+                if provider == "orchestration_synthesizer"
+                    && message.contains("after 3 synthesis attempts")
+        ));
     }
 
     #[tokio::test]
@@ -4555,6 +4809,166 @@ mod tests {
                 | AgentRole::ReasoningSummarizer
                 | AgentRole::Synthesizer
                 | AgentRole::Verifier => Ok(ProviderResponse::default()),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PersistentUnderTargetPlannerProvider {
+        planner_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PersistentUnderTargetPlannerProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    self.planner_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("persistent-plan-63"),
+                            scope: request.scope,
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: "persistent off-by-one model plan".to_string(),
+                                children: model_children(
+                                    "persistent-xhigh",
+                                    63,
+                                    "model-selected xhigh slice",
+                                ),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 8192,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: ProviderUsage::default(),
+                    })
+                }
+                AgentRole::Worker => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: request.task.objective,
+                    }],
+                    tool_calls: vec![],
+                    usage: ProviderUsage::default(),
+                }),
+                AgentRole::Synthesizer => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from("persistent-xhigh-final"),
+                        scope: request.scope,
+                        text: "persistent xhigh completed".to_string(),
+                    }],
+                    tool_calls: vec![],
+                    usage: ProviderUsage::default(),
+                }),
+                AgentRole::Leader | AgentRole::ReasoningSummarizer | AgentRole::Verifier => {
+                    Ok(ProviderResponse::default())
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct EmptySynthesisProvider {
+        succeed_on: Option<usize>,
+        synth_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        synthesis_settings: std::sync::Arc<std::sync::Mutex<Vec<(bool, serde_json::Value)>>>,
+    }
+
+    impl EmptySynthesisProvider {
+        fn succeed_on(attempt: usize) -> Self {
+            Self {
+                succeed_on: Some(attempt),
+                synth_calls: Default::default(),
+                synthesis_settings: Default::default(),
+            }
+        }
+
+        fn never_succeeds() -> Self {
+            Self {
+                succeed_on: None,
+                synth_calls: Default::default(),
+                synthesis_settings: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for EmptySynthesisProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    let target = target_child_agents(&request);
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("empty-synthesis-plan"),
+                            scope: request.scope,
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: "full model-selected plan".to_string(),
+                                children: model_children(
+                                    "empty-synthesis-child",
+                                    target,
+                                    "model-selected coverage slice",
+                                ),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 8192,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: ProviderUsage::default(),
+                    })
+                }
+                AgentRole::Worker => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: request.task.objective,
+                    }],
+                    tool_calls: vec![],
+                    usage: ProviderUsage::default(),
+                }),
+                AgentRole::Synthesizer => {
+                    self.synthesis_settings
+                        .lock()
+                        .unwrap()
+                        .push((request.thinking_enabled, request.provider_options.clone()));
+                    let attempt = self
+                        .synth_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    let artifacts = if self.succeed_on.is_some_and(|target| attempt >= target) {
+                        vec![AgentArtifact::Text {
+                            id: ArtifactId::from(format!("synthesis-attempt-{attempt}")),
+                            scope: request.scope,
+                            text: "XHIGH_NON_EMPTY_OK".to_string(),
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(ProviderResponse {
+                        artifacts,
+                        tool_calls: vec![],
+                        usage: ProviderUsage::default(),
+                    })
+                }
+                AgentRole::Leader | AgentRole::ReasoningSummarizer | AgentRole::Verifier => {
+                    Ok(ProviderResponse::default())
+                }
             }
         }
     }

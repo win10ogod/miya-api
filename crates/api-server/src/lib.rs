@@ -14173,6 +14173,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orchestration_sse_converts_late_empty_synthesis_failure_to_error_event() {
+        let response = orchestration_sse_response_with_interval(
+            async {
+                provider_error_response(ProviderError::InvalidResponse {
+                    provider: "orchestration_synthesizer".to_string(),
+                    message: "model returned no final text after 3 synthesis attempts".to_string(),
+                })
+            },
+            RuntimeMetrics::default(),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("event: error"));
+        assert!(body.contains("invalid_provider_response"));
+        assert!(body.contains("no final text after 3 synthesis attempts"));
+    }
+
+    #[tokio::test]
     async fn routes_openai_stream_true_returns_sse_answer() {
         let app = build_router();
         let response = tower::ServiceExt::oneshot(
