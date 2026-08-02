@@ -53,7 +53,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 const MAX_OPENAI_BATCH_REQUESTS: usize = 50_000;
@@ -610,6 +610,14 @@ pub struct RuntimeMetrics {
     http_latency_micros: Arc<AtomicU64>,
     orchestration_streams_active: Arc<AtomicU64>,
     orchestration_stream_heartbeats: Arc<AtomicU64>,
+    orchestration_admission_limit: Arc<AtomicU64>,
+    orchestrations_active: Arc<AtomicU64>,
+    orchestrations_queued: Arc<AtomicU64>,
+    orchestrations_admitted: Arc<AtomicU64>,
+    orchestration_queue_timeouts: Arc<AtomicU64>,
+    orchestration_queue_wait_micros: Arc<AtomicU64>,
+    kernel_request_timeouts: Arc<AtomicU64>,
+    kernel_agent_timeouts: Arc<AtomicU64>,
     provider_attempts: Arc<AtomicU64>,
     provider_retries: Arc<AtomicU64>,
     provider_failures: Arc<AtomicU64>,
@@ -628,6 +636,14 @@ impl RuntimeMetrics {
                 "# TYPE miya_http_request_duration_microseconds_total counter\nmiya_http_request_duration_microseconds_total {}\n",
                 "# TYPE miya_orchestration_streams_active gauge\nmiya_orchestration_streams_active {}\n",
                 "# TYPE miya_orchestration_stream_heartbeats_total counter\nmiya_orchestration_stream_heartbeats_total {}\n",
+                "# TYPE miya_orchestration_admission_limit gauge\nmiya_orchestration_admission_limit {}\n",
+                "# TYPE miya_orchestrations_active gauge\nmiya_orchestrations_active {}\n",
+                "# TYPE miya_orchestrations_queued gauge\nmiya_orchestrations_queued {}\n",
+                "# TYPE miya_orchestrations_admitted_total counter\nmiya_orchestrations_admitted_total {}\n",
+                "# TYPE miya_orchestration_queue_timeouts_total counter\nmiya_orchestration_queue_timeouts_total {}\n",
+                "# TYPE miya_orchestration_queue_wait_microseconds_total counter\nmiya_orchestration_queue_wait_microseconds_total {}\n",
+                "# TYPE miya_kernel_request_timeouts_total counter\nmiya_kernel_request_timeouts_total {}\n",
+                "# TYPE miya_kernel_agent_timeouts_total counter\nmiya_kernel_agent_timeouts_total {}\n",
                 "# TYPE miya_provider_attempts_total counter\nmiya_provider_attempts_total {}\n",
                 "# TYPE miya_provider_retries_total counter\nmiya_provider_retries_total {}\n",
                 "# TYPE miya_provider_failures_total counter\nmiya_provider_failures_total {}\n",
@@ -641,6 +657,14 @@ impl RuntimeMetrics {
             self.http_latency_micros.load(Ordering::Relaxed),
             self.orchestration_streams_active.load(Ordering::Relaxed),
             self.orchestration_stream_heartbeats.load(Ordering::Relaxed),
+            self.orchestration_admission_limit.load(Ordering::Relaxed),
+            self.orchestrations_active.load(Ordering::Relaxed),
+            self.orchestrations_queued.load(Ordering::Relaxed),
+            self.orchestrations_admitted.load(Ordering::Relaxed),
+            self.orchestration_queue_timeouts.load(Ordering::Relaxed),
+            self.orchestration_queue_wait_micros.load(Ordering::Relaxed),
+            self.kernel_request_timeouts.load(Ordering::Relaxed),
+            self.kernel_agent_timeouts.load(Ordering::Relaxed),
             self.provider_attempts.load(Ordering::Relaxed),
             self.provider_retries.load(Ordering::Relaxed),
             self.provider_failures.load(Ordering::Relaxed),
@@ -655,10 +679,12 @@ impl RuntimeMetrics {
 #[derive(Clone)]
 pub struct AppState {
     kernel: Arc<KernelRunner<Arc<dyn ModelProvider>>>,
+    kernel_policy: KernelPolicy,
     context: ApiContextManager,
     responses: ResponsesStore,
     direct: DirectBackend,
     tenant_limiter: TenantConcurrencyLimiter,
+    orchestration_admission: OrchestrationAdmission,
     training_trace: TrainingTraceRecorder,
     public_reasoning_mode: PublicReasoningMode,
     shared_api_key: Option<Arc<str>>,
@@ -909,11 +935,13 @@ impl AppState {
         let responses = ResponsesStore::new(context.store.clone());
         let metrics = RuntimeMetrics::default();
         Self {
-            kernel: Arc::new(KernelRunner::new(provider, policy)),
+            kernel: Arc::new(KernelRunner::new(provider, policy.clone())),
+            kernel_policy: policy,
             context,
             responses,
             direct,
             tenant_limiter,
+            orchestration_admission: OrchestrationAdmission::disabled(metrics.clone()),
             training_trace,
             public_reasoning_mode: PublicReasoningMode::Request,
             shared_api_key: None,
@@ -1028,6 +1056,7 @@ impl TrainingTraceRecorder {
 #[derive(Clone)]
 pub struct ProviderAdmission {
     semaphore: Option<Arc<Semaphore>>,
+    max_concurrent: Option<usize>,
     wait_timeout: Duration,
 }
 
@@ -1035,6 +1064,7 @@ impl ProviderAdmission {
     pub fn disabled() -> Self {
         Self {
             semaphore: None,
+            max_concurrent: None,
             wait_timeout: Duration::from_secs(30),
         }
     }
@@ -1056,6 +1086,7 @@ impl ProviderAdmission {
         )?;
         Ok(Self {
             semaphore: (max_concurrent > 0).then(|| Arc::new(Semaphore::new(max_concurrent))),
+            max_concurrent: (max_concurrent > 0).then_some(max_concurrent),
             wait_timeout: Duration::from_millis(wait_timeout_ms.max(1)),
         })
     }
@@ -1081,6 +1112,192 @@ impl ProviderAdmission {
 
 struct ProviderAdmissionPermit {
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+struct OrchestrationAdmission {
+    semaphore: Option<Arc<Semaphore>>,
+    limit: Option<usize>,
+    parallel_agents_per_slot: usize,
+    wait_timeout: Duration,
+    metrics: RuntimeMetrics,
+}
+
+impl OrchestrationAdmission {
+    fn disabled(metrics: RuntimeMetrics) -> Self {
+        metrics
+            .orchestration_admission_limit
+            .store(0, Ordering::Relaxed);
+        Self {
+            semaphore: None,
+            limit: None,
+            parallel_agents_per_slot: 1,
+            wait_timeout: Duration::from_millis(DEFAULT_TENANT_QUEUE_TIMEOUT_MS),
+            metrics,
+        }
+    }
+
+    fn with_limit_and_parallelism(
+        limit: usize,
+        parallel_agents_per_slot: usize,
+        wait_timeout: Duration,
+        metrics: RuntimeMetrics,
+    ) -> Self {
+        if limit == 0 {
+            return Self::disabled(metrics);
+        }
+        metrics
+            .orchestration_admission_limit
+            .store(limit as u64, Ordering::Relaxed);
+        Self {
+            semaphore: Some(Arc::new(Semaphore::new(limit))),
+            limit: Some(limit),
+            parallel_agents_per_slot: parallel_agents_per_slot.max(1),
+            wait_timeout,
+            metrics,
+        }
+    }
+
+    fn from_env(
+        provider_admission: &ProviderAdmission,
+        max_parallel_agents: u16,
+        metrics: RuntimeMetrics,
+    ) -> Result<Self, String> {
+        let explicit_limit = env_configured_optional_usize(&[
+            "MIYA_MAX_CONCURRENT_ORCHESTRATIONS",
+            "MULTI_AGENT_MAX_CONCURRENT_ORCHESTRATIONS",
+        ])?;
+        let derived_limit = derived_orchestration_limit(
+            provider_admission.max_concurrent,
+            usize::from(max_parallel_agents.max(1)),
+        );
+        let limit = explicit_limit.unwrap_or(derived_limit);
+        let wait_timeout_ms = env_optional_u64(
+            &["MIYA_ORCHESTRATION_QUEUE_TIMEOUT_MS"],
+            DEFAULT_TENANT_QUEUE_TIMEOUT_MS,
+        )?;
+        Ok(match limit {
+            Some(limit) if limit > 0 => Self::with_limit_and_parallelism(
+                limit,
+                usize::from(max_parallel_agents.max(1)),
+                Duration::from_millis(wait_timeout_ms.max(1)),
+                metrics,
+            ),
+            _ => Self::disabled(metrics),
+        })
+    }
+
+    async fn acquire_for_parallelism(
+        &self,
+        requested_parallel_agents: usize,
+    ) -> Result<OrchestrationAdmissionPermit, OrchestrationAdmissionError> {
+        let Some(semaphore) = &self.semaphore else {
+            return Ok(OrchestrationAdmissionPermit {
+                _permit: None,
+                metrics: self.metrics.clone(),
+                active: false,
+            });
+        };
+
+        self.metrics
+            .orchestrations_queued
+            .fetch_add(1, Ordering::Relaxed);
+        let queue_guard = OrchestrationQueueGaugeGuard {
+            metrics: self.metrics.clone(),
+        };
+        let started = Instant::now();
+        let permit_weight = u32::try_from(
+            requested_parallel_agents
+                .max(1)
+                .div_ceil(self.parallel_agents_per_slot)
+                .min(self.limit.unwrap_or(1))
+                .max(1),
+        )
+        .unwrap_or(u32::MAX);
+        let permit = match tokio::time::timeout(
+            self.wait_timeout,
+            semaphore.clone().acquire_many_owned(permit_weight),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(OrchestrationAdmissionError::Closed);
+            }
+            Err(_) => {
+                self.metrics
+                    .orchestration_queue_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(OrchestrationAdmissionError::Timeout {
+                    wait_ms: self.wait_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                });
+            }
+        };
+        self.metrics.orchestration_queue_wait_micros.fetch_add(
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        drop(queue_guard);
+        self.metrics
+            .orchestrations_admitted
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .orchestrations_active
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(OrchestrationAdmissionPermit {
+            _permit: Some(permit),
+            metrics: self.metrics.clone(),
+            active: true,
+        })
+    }
+}
+
+fn derived_orchestration_limit(
+    provider_max_concurrent: Option<usize>,
+    max_parallel_agents: usize,
+) -> Option<usize> {
+    provider_max_concurrent.map(|provider_limit| {
+        provider_limit
+            .checked_div(max_parallel_agents.max(1))
+            .unwrap_or(0)
+            .max(1)
+    })
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum OrchestrationAdmissionError {
+    #[error("orchestration queue wait exceeded {wait_ms} ms")]
+    Timeout { wait_ms: u64 },
+    #[error("orchestration concurrency limiter was closed")]
+    Closed,
+}
+
+struct OrchestrationQueueGaugeGuard {
+    metrics: RuntimeMetrics,
+}
+
+impl Drop for OrchestrationQueueGaugeGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .orchestrations_queued
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct OrchestrationAdmissionPermit {
+    _permit: Option<OwnedSemaphorePermit>,
+    metrics: RuntimeMetrics,
+    active: bool,
+}
+
+impl Drop for OrchestrationAdmissionPermit {
+    fn drop(&mut self) {
+        if self.active {
+            self.metrics
+                .orchestrations_active
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2216,6 +2433,28 @@ fn mock_direct_openai_response(request: &serde_json::Value) -> serde_json::Value
         .and_then(|value| value.as_str())
         .unwrap_or("mock");
     let text = direct_openai_user_text(request);
+    let (message, finish_reason) = if text.to_ascii_lowercase().contains("tool") {
+        (
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_mock_direct",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            }),
+            "tool_calls",
+        )
+    } else {
+        (
+            serde_json::json!({
+                "role": "assistant",
+                "content": format!("direct backend response: {text}")
+            }),
+            "stop",
+        )
+    };
     serde_json::json!({
         "id": format!("chatcmpl-{}", Uuid::new_v4()),
         "object": "chat.completion",
@@ -2223,11 +2462,8 @@ fn mock_direct_openai_response(request: &serde_json::Value) -> serde_json::Value
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": format!("direct backend response: {text}")
-            },
-            "finish_reason": "stop"
+            "message": message,
+            "finish_reason": finish_reason
         }],
         "usage": {
             "prompt_tokens": 0,
@@ -2243,16 +2479,32 @@ fn mock_direct_anthropic_response(request: &serde_json::Value) -> serde_json::Va
         .and_then(|value| value.as_str())
         .unwrap_or("mock");
     let text = direct_anthropic_user_text(request);
+    let (content, stop_reason) = if text.to_ascii_lowercase().contains("tool") {
+        (
+            serde_json::json!([{
+                "type": "tool_use",
+                "id": "toolu_mock_direct",
+                "name": "lookup",
+                "input": {}
+            }]),
+            "tool_use",
+        )
+    } else {
+        (
+            serde_json::json!([{
+                "type": "text",
+                "text": format!("direct backend response: {text}")
+            }]),
+            "end_turn",
+        )
+    };
     serde_json::json!({
         "id": format!("msg_{}", Uuid::new_v4()),
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{
-            "type": "text",
-            "text": format!("direct backend response: {text}")
-        }],
-        "stop_reason": "end_turn",
+        "content": content,
+        "stop_reason": stop_reason,
         "usage": {
             "input_tokens": 0,
             "output_tokens": 0
@@ -3018,15 +3270,26 @@ pub fn build_router_from_env() -> Result<Router, String> {
         metrics: metrics.clone(),
     });
     let context = ApiContextManager::from_env()?;
+    let tenant_limiter = TenantConcurrencyLimiter::from_env();
+    let training_trace = TrainingTraceRecorder::from_env();
+    let kernel_policy = kernel_policy_from_env()?;
+    let orchestration_admission = OrchestrationAdmission::from_env(
+        &provider_admission,
+        kernel_policy.limits.max_parallel_agents,
+        metrics.clone(),
+    )?;
+    log_runtime_stability_profile(
+        &kernel_policy,
+        &provider_admission,
+        &orchestration_admission,
+        &resilience,
+    )?;
     let direct = DirectBackend::from_env(
         &provider_kind,
         provider_admission,
         resilience,
         metrics.clone(),
     )?;
-    let tenant_limiter = TenantConcurrencyLimiter::from_env();
-    let training_trace = TrainingTraceRecorder::from_env();
-    let kernel_policy = kernel_policy_from_env()?;
     let mut state = AppState::with_provider_context_direct_tenant_limiter_training_trace_and_policy(
         provider,
         context,
@@ -3037,6 +3300,7 @@ pub fn build_router_from_env() -> Result<Router, String> {
     );
     state.public_reasoning_mode = PublicReasoningMode::from_env();
     state.shared_api_key = shared_api_key_from_env()?;
+    state.orchestration_admission = orchestration_admission;
     state.metrics = metrics;
     let data_dir = std::env::var("MIYA_DATA_DIR")
         .map(PathBuf::from)
@@ -3103,6 +3367,61 @@ fn kernel_policy_from_env() -> Result<KernelPolicy, String> {
     Ok(policy)
 }
 
+fn log_runtime_stability_profile(
+    policy: &KernelPolicy,
+    provider_admission: &ProviderAdmission,
+    orchestration_admission: &OrchestrationAdmission,
+    resilience: &ResilienceConfig,
+) -> Result<(), String> {
+    let provider_timeout_secs = env_optional_u64(&["MIYA_PROVIDER_TIMEOUT_SECS"], 300)?;
+    let provider_timeout_ms = provider_timeout_secs.saturating_mul(1_000);
+    let request_timeout_ms = policy.limits.request_timeout_ms;
+    let agent_timeout_ms = policy.limits.agent_timeout_ms;
+    let parallel = u64::from(policy.limits.max_parallel_agents.max(1));
+    let high_waves = 32_u64.div_ceil(parallel);
+    let xhigh_waves = 64_u64.div_ceil(parallel);
+    let high_average_stage_budget_ms = request_timeout_ms / high_waves.saturating_add(2);
+    let xhigh_average_stage_budget_ms = request_timeout_ms / xhigh_waves.saturating_add(2);
+
+    info!(
+        event = "runtime_stability_profile",
+        request_timeout_ms,
+        agent_timeout_ms,
+        provider_timeout_ms,
+        provider_max_concurrent = provider_admission.max_concurrent.unwrap_or(0),
+        provider_queue_timeout_ms = provider_admission.wait_timeout.as_millis() as u64,
+        provider_max_retries = resilience.max_retries,
+        max_parallel_agents = policy.limits.max_parallel_agents,
+        orchestration_max_concurrent = orchestration_admission.limit.unwrap_or(0),
+        orchestration_queue_timeout_ms = orchestration_admission.wait_timeout.as_millis() as u64,
+        high_waves,
+        xhigh_waves,
+        high_average_stage_budget_ms,
+        xhigh_average_stage_budget_ms,
+        "effective slow-model stability profile"
+    );
+
+    if agent_timeout_ms < provider_timeout_ms {
+        warn!(
+            event = "unstable_timeout_stack",
+            agent_timeout_ms,
+            provider_timeout_ms,
+            "MIYA_AGENT_TIMEOUT_MS is shorter than the provider HTTP timeout; the kernel will cancel slow reasoning calls before provider timeout/retry handling can finish"
+        );
+    }
+    if request_timeout_ms < agent_timeout_ms.saturating_mul(3) {
+        warn!(
+            event = "insufficient_orchestration_deadline",
+            request_timeout_ms,
+            agent_timeout_ms,
+            high_waves,
+            xhigh_waves,
+            "the total request deadline cannot cover even one full-latency planner, worker wave, and synthesizer; high/xhigh can terminate before final text"
+        );
+    }
+    Ok(())
+}
+
 fn env_u16(names: &[&str]) -> Result<Option<u16>, String> {
     for name in names {
         let Ok(value) = std::env::var(name) else {
@@ -3150,6 +3469,20 @@ fn env_optional_u64(names: &[&str], default: u64) -> Result<u64, String> {
 fn env_optional_usize(names: &[&str], default: usize) -> Result<usize, String> {
     let value = env_optional_u64(names, default as u64)?;
     usize::try_from(value).map_err(|_| format!("{} is too large", names[0]))
+}
+
+fn env_configured_optional_usize(names: &[&str]) -> Result<Option<Option<usize>>, String> {
+    for name in names {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        let parsed = value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("{name} must be a non-negative integer"))?;
+        return Ok(Some((parsed > 0).then_some(parsed)));
+    }
+    Ok(None)
 }
 
 pub fn build_router_with_provider(provider: Arc<dyn ModelProvider>) -> Router {
@@ -3656,14 +3989,14 @@ async fn completions(
                 ),
                 tenant_permit,
             ),
-            Err(error) => kernel_error_response(error),
+            Err(error) => kernel_error_response_with_metrics(error, &state.metrics),
         };
     }
 
     let metrics = state.metrics.clone();
     let response_future = async move {
         let _tenant_permit = tenant_permit;
-        match state.kernel.run(normalized).await {
+        match run_admitted_kernel(&state, normalized).await {
             Ok(output) => {
                 let context_report =
                     match finalize_context_report(&state.context, &prepared_context, &output).await
@@ -3695,7 +4028,7 @@ async fn completions(
                 attach_context_report(&mut response, prepared_context.as_ref(), context_report);
                 Json(response).into_response()
             }
-            Err(error) => kernel_error_response(error),
+            Err(response) => response,
         }
     };
     if stream {
@@ -3788,14 +4121,14 @@ async fn chat_completions(
                 ),
                 tenant_permit,
             ),
-            Err(error) => kernel_error_response(error),
+            Err(error) => kernel_error_response_with_metrics(error, &state.metrics),
         };
     }
 
     let metrics = state.metrics.clone();
     let response_future = async move {
         let _tenant_permit = tenant_permit;
-        match state.kernel.run(normalized).await {
+        match run_admitted_kernel(&state, normalized).await {
             Ok(output) => {
                 let context_report =
                     match finalize_context_report(&state.context, &prepared_context, &output).await
@@ -3830,7 +4163,7 @@ async fn chat_completions(
                 attach_context_report(&mut response, prepared_context.as_ref(), context_report);
                 Json(response).into_response()
             }
-            Err(error) => kernel_error_response(error),
+            Err(response) => response,
         }
     };
     if stream {
@@ -3943,13 +4276,13 @@ async fn responses(
                 ),
                 tenant_permit,
             ),
-            Err(error) => kernel_error_response(error),
+            Err(error) => kernel_error_response_with_metrics(error, &state.metrics),
         };
     }
 
     let metrics = state.metrics.clone();
     let response_future = async move {
-        match state.kernel.run(normalized).await {
+        match run_admitted_kernel(&state, normalized).await {
             Ok(output) => {
                 let context_report =
                     match finalize_context_report(&state.context, &prepared_context, &output).await
@@ -3994,7 +4327,7 @@ async fn responses(
                 }
                 response_with_tenant_permit(Json(response).into_response(), tenant_permit)
             }
-            Err(error) => kernel_error_response(error),
+            Err(response) => response,
         }
     };
     if stream {
@@ -4581,11 +4914,10 @@ async fn execute_openai_responses_value_with_id(
         telemetry_context_from_normalized("openai.responses", &normalized, true, None);
     let training_request = state.training_trace.capture_request(&normalized);
 
-    let output = state
-        .kernel
-        .run(normalized)
-        .await
-        .map_err(|error| error.to_string())?;
+    let output = match run_admitted_kernel(state, normalized).await {
+        Ok(output) => output,
+        Err(response) => return Err(response_error_message(response).await),
+    };
     let context_report = finalize_context_report(&state.context, &prepared_context, &output)
         .await
         .map_err(|error| error.to_string())?;
@@ -5039,14 +5371,14 @@ async fn messages(
                 ),
                 tenant_permit,
             ),
-            Err(error) => kernel_error_response(error),
+            Err(error) => kernel_error_response_with_metrics(error, &state.metrics),
         };
     }
 
     let metrics = state.metrics.clone();
     let response_future = async move {
         let _tenant_permit = tenant_permit;
-        match state.kernel.run(normalized).await {
+        match run_admitted_kernel(&state, normalized).await {
             Ok(output) => {
                 let context_report =
                     match finalize_context_report(&state.context, &prepared_context, &output).await
@@ -5077,7 +5409,7 @@ async fn messages(
                 attach_context_report(&mut response, prepared_context.as_ref(), context_report);
                 Json(response).into_response()
             }
-            Err(error) => kernel_error_response(error),
+            Err(response) => response,
         }
     };
     if stream {
@@ -5462,6 +5794,95 @@ fn api_error_parts(error: ApiError) -> (StatusCode, &'static str, String) {
         ApiError::InvalidRequest(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
     };
     (status, code, message)
+}
+
+async fn run_admitted_kernel(
+    state: &AppState,
+    normalized: NormalizedRequest,
+) -> Result<KernelOutput, Response> {
+    let requested_parallel_agents = state
+        .kernel_policy
+        .for_request(&normalized)
+        .limits
+        .max_parallel_agents;
+    let _orchestration_permit = state
+        .orchestration_admission
+        .acquire_for_parallelism(usize::from(requested_parallel_agents.max(1)))
+        .await
+        .map_err(orchestration_admission_error_response)?;
+    state
+        .kernel
+        .run(normalized)
+        .await
+        .map_err(|error| kernel_error_response_with_metrics(error, &state.metrics))
+}
+
+fn kernel_error_response_with_metrics(error: KernelError, metrics: &RuntimeMetrics) -> Response {
+    match &error {
+        KernelError::RequestTimeout { .. } => {
+            metrics
+                .kernel_request_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        KernelError::AgentTimeout { .. } => {
+            metrics
+                .kernel_agent_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    kernel_error_response(error)
+}
+
+fn orchestration_admission_error_response(error: OrchestrationAdmissionError) -> Response {
+    let retry_after_ms = match &error {
+        OrchestrationAdmissionError::Timeout { wait_ms } => Some(*wait_ms),
+        OrchestrationAdmissionError::Closed => None,
+    };
+    let mut error_body = serde_json::json!({
+        "message": error.to_string(),
+        "type": "server_error",
+        "code": "orchestration_overloaded"
+    });
+    if let Some(retry_after_ms) = retry_after_ms {
+        error_body["retry_after_ms"] = serde_json::json!(retry_after_ms);
+    }
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": error_body})),
+    )
+        .into_response();
+    if let Some(retry_after_ms) = retry_after_ms {
+        let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+        if let Ok(value) = header::HeaderValue::from_str(&retry_after_seconds.max(1).to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
+async fn response_error_message(response: Response) -> String {
+    let status = response.status();
+    match axum::body::to_bytes(response.into_body(), 1024 * 1024).await {
+        Ok(body) => serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(|message| message.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                let body = String::from_utf8_lossy(&body);
+                if body.trim().is_empty() {
+                    format!("gateway execution failed with HTTP {status}")
+                } else {
+                    body.into_owned()
+                }
+            }),
+        Err(error) => format!("gateway execution failed with HTTP {status}: {error}"),
+    }
 }
 
 fn kernel_error_response(error: KernelError) -> Response {
@@ -9278,12 +9699,9 @@ fn requires_full_orchestration_before_stream(
     request: &NormalizedRequest,
     include_public_reasoning: bool,
 ) -> bool {
-    if include_public_reasoning
+    if !request.reasoning_effort.is_direct()
+        || include_public_reasoning
         || include_encrypted_subagent_state(&request.metadata)
-        || matches!(
-            request.reasoning_effort,
-            ReasoningEffort::High | ReasoningEffort::XHigh
-        )
     {
         return true;
     }
@@ -11787,6 +12205,122 @@ mod tests {
     }
 
     #[test]
+    fn every_non_direct_stream_preserves_full_orchestration_coverage() {
+        for (effort, expected_agents) in [("low", 4), ("medium", 16), ("high", 32), ("xhigh", 64)] {
+            let request: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+                "model": "mock",
+                "reasoning_effort": effort,
+                "messages": [{"role": "user", "content": "preserve effort coverage"}]
+            }))
+            .unwrap();
+            let normalized = normalize_openai_chat(request).unwrap();
+            assert_eq!(normalized.reasoning_effort.max_agents(), expected_agents);
+            assert!(requires_full_orchestration_before_stream(
+                &normalized,
+                false
+            ));
+        }
+
+        let direct: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "mock",
+            "reasoning_effort": "none",
+            "messages": [{"role": "user", "content": "direct stream"}]
+        }))
+        .unwrap();
+        let direct = normalize_openai_chat(direct).unwrap();
+        assert!(!requires_full_orchestration_before_stream(&direct, false));
+    }
+
+    #[test]
+    fn orchestration_admission_derives_capacity_without_reducing_agent_coverage() {
+        assert_eq!(derived_orchestration_limit(Some(16), 4), Some(4));
+        assert_eq!(derived_orchestration_limit(Some(64), 4), Some(16));
+        assert_eq!(derived_orchestration_limit(Some(2), 4), Some(1));
+        assert_eq!(derived_orchestration_limit(None, 4), None);
+        assert_eq!(ReasoningEffort::XHigh.max_agents(), 64);
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_bounds_whole_requests_and_records_pressure() {
+        let metrics = RuntimeMetrics::default();
+        let admission = OrchestrationAdmission::with_limit_and_parallelism(
+            1,
+            1,
+            Duration::from_millis(5),
+            metrics.clone(),
+        );
+        let first = admission.acquire_for_parallelism(1).await.unwrap();
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 1);
+
+        let error = match admission.acquire_for_parallelism(1).await {
+            Ok(_) => panic!("second orchestration unexpectedly bypassed admission"),
+            Err(error) => error,
+        };
+        assert_eq!(error, OrchestrationAdmissionError::Timeout { wait_ms: 5 });
+        assert_eq!(metrics.orchestrations_queued.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.orchestration_queue_timeouts.load(Ordering::Relaxed),
+            1
+        );
+
+        drop(first);
+        let second = admission.acquire_for_parallelism(1).await.unwrap();
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 1);
+        drop(second);
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.orchestrations_admitted.load(Ordering::Relaxed), 2);
+        let prometheus = metrics.prometheus();
+        assert!(prometheus.contains("miya_orchestration_admission_limit 1"));
+        assert!(prometheus.contains("miya_orchestration_queue_timeouts_total 1"));
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_weights_per_request_parallelism() {
+        let metrics = RuntimeMetrics::default();
+        let admission = OrchestrationAdmission::with_limit_and_parallelism(
+            4,
+            4,
+            Duration::from_millis(5),
+            metrics.clone(),
+        );
+        let first = admission.acquire_for_parallelism(8).await.unwrap();
+        let second = admission.acquire_for_parallelism(8).await.unwrap();
+        let error = match admission.acquire_for_parallelism(4).await {
+            Ok(_) => panic!("weighted orchestration unexpectedly overcommitted admission"),
+            Err(error) => error,
+        };
+        assert_eq!(error, OrchestrationAdmissionError::Timeout { wait_ms: 5 });
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 2);
+
+        drop(first);
+        let third = admission.acquire_for_parallelism(4).await.unwrap();
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 2);
+        drop(second);
+        drop(third);
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn kernel_timeout_metrics_distinguish_request_and_agent_deadlines() {
+        let metrics = RuntimeMetrics::default();
+        let _ = kernel_error_response_with_metrics(
+            KernelError::RequestTimeout {
+                timeout_ms: 120_000,
+            },
+            &metrics,
+        );
+        let _ = kernel_error_response_with_metrics(
+            KernelError::AgentTimeout {
+                task_id: TaskId::from("synthesizer"),
+                timeout_ms: 60_000,
+            },
+            &metrics,
+        );
+        assert_eq!(metrics.kernel_request_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.kernel_agent_timeouts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn text_with_public_reasoning_preserves_structured_final_text_formatting() {
         let final_text =
             "<doc>\n<section>\n### Heading\n<details><hr>\nValue: 1\n</details>\n</section>";
@@ -13398,6 +13932,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routes_openai_medium_stream_preserves_full_orchestration_and_tool_calls() {
+        let app = build_router();
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "reasoning_effort": "medium",
+                        "stream": true,
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "parameters": {"type": "object"}
+                            }
+                        }],
+                        "messages": [{"role": "user", "content": "please use a tool"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.starts_with(": miya orchestration active"));
+        assert!(body.contains("\"tool_calls\""));
+        assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[tokio::test]
     async fn routes_openai_legacy_functions_return_function_call_shape() {
         let app = build_router();
         let response = tower::ServiceExt::oneshot(
@@ -14111,6 +14682,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routes_anthropic_medium_stream_preserves_full_orchestration_and_tool_use() {
+        let app = build_router();
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "max_tokens": 256,
+                        "reasoning_effort": "medium",
+                        "stream": true,
+                        "tools": [{
+                            "name": "lookup",
+                            "input_schema": {"type": "object"}
+                        }],
+                        "messages": [{"role": "user", "content": "please use a tool"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.starts_with(": miya orchestration active"));
+        assert!(body.contains("\"type\":\"tool_use\""));
+        assert!(body.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    #[tokio::test]
     async fn routes_anthropic_stream_reasoning_effort_none_bypasses_kernel() {
         let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
         let app = build_router_with_provider(provider.clone());
@@ -14193,6 +14799,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orchestration_sse_converts_late_admission_timeout_to_sdk_visible_error() {
+        let response = orchestration_sse_response_with_interval(
+            async {
+                orchestration_admission_error_response(OrchestrationAdmissionError::Timeout {
+                    wait_ms: 30_000,
+                })
+            },
+            RuntimeMetrics::default(),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.starts_with(": miya orchestration active"));
+        assert!(body.contains("event: error"));
+        assert!(body.contains("orchestration_overloaded"));
+        assert!(body.contains("30000 ms"));
+        assert!(body.contains("\"retry_after_ms\":30000"));
+    }
+
+    #[tokio::test]
     async fn routes_openai_stream_true_returns_sse_answer() {
         let app = build_router();
         let response = tower::ServiceExt::oneshot(
@@ -14205,6 +14832,7 @@ mod tests {
                     serde_json::json!({
                         "model": "mock",
                         "stream": true,
+                        "reasoning_effort": "none",
                         "messages": [{"role": "user", "content": "hello"}]
                     })
                     .to_string(),
@@ -14226,7 +14854,7 @@ mod tests {
         );
         let body = response_text(response).await;
         assert!(body.contains("\"object\":\"chat.completion.chunk\""));
-        assert!(body.contains("\"delta\":{\"content\":\"Here is a clear, usable answer: hello\"}"));
+        assert!(body.contains("\"delta\":{\"content\":\"direct backend response: hello\"}"));
         assert!(body.contains("data: [DONE]"));
     }
 
@@ -14316,6 +14944,7 @@ mod tests {
                         "model": "mock",
                         "prompt": "generic prompt",
                         "stream": true,
+                        "reasoning_effort": "none",
                         "max_tokens": 65536,
                         "temperature": 0.75,
                         "top_p": 1,
@@ -14542,7 +15171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_openai_stream_uses_provider_token_stream_before_completion() {
+    async fn routes_openai_stream_medium_preserves_full_orchestration_before_completion() {
         let provider = std::sync::Arc::new(StreamingProbeProvider::default());
         let app = build_router_with_provider(provider.clone());
         let response = tower::ServiceExt::oneshot(
@@ -14565,14 +15194,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(provider.invoke_calls(), 0);
-        assert_eq!(provider.stream_calls(), 1);
-        let first_text = first_stream_text(response).await;
-        assert!(first_text.contains("stream-token-1"));
+        let body = response_text(response).await;
+        assert_eq!(provider.invoke_calls(), 18);
+        assert_eq!(provider.stream_calls(), 0);
+        assert!(body.starts_with(": miya orchestration active"));
+        assert!(body.contains("non-stream fallback"));
     }
 
     #[tokio::test]
-    async fn routes_openai_stream_tool_call_returns_sse_tool_delta() {
+    async fn routes_openai_direct_stream_tool_call_returns_sse_tool_delta() {
         let app = build_router();
         let response = tower::ServiceExt::oneshot(
             app,
@@ -14584,6 +15214,7 @@ mod tests {
                     serde_json::json!({
                         "model": "mock",
                         "stream": true,
+                        "reasoning_effort": "none",
                         "messages": [{"role": "user", "content": "please use a tool"}]
                     })
                     .to_string(),
@@ -14601,26 +15232,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_openai_stream_tool_delta_overrides_stop_finish_reason() {
-        let app = build_router_with_provider(std::sync::Arc::new(StopAfterToolStreamProvider));
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "model": "mock",
-                        "stream": true,
-                        "messages": [{"role": "user", "content": "tool"}]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    async fn openai_provider_stream_tool_delta_overrides_stop_finish_reason() {
+        let provider = StopAfterToolStreamProvider;
+        let provider_stream = provider.stream(provider_probe_request()).await.unwrap();
+        let response = format_openai_provider_stream_response(
+            "mock".to_string(),
+            provider_stream,
+            OpenAiToolResponseFormat::Tools,
+            direct_telemetry_context(
+                "test.openai_stream",
+                "mock".to_string(),
+                "openai_chat",
+                &RequestContext::default(),
+                true,
+                None,
+            ),
+        );
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = response_text(response).await;
@@ -14780,6 +15407,7 @@ mod tests {
                         "model": "mock",
                         "max_tokens": 256,
                         "stream": true,
+                        "reasoning_effort": "none",
                         "messages": [{"role": "user", "content": "hello"}]
                     })
                     .to_string(),
@@ -14802,12 +15430,12 @@ mod tests {
         let body = response_text(response).await;
         assert!(body.contains("event: message_start"));
         assert!(body.contains("event: content_block_delta"));
-        assert!(body.contains("\"text\":\"Here is a clear, usable answer: hello\""));
+        assert!(body.contains("\"text\":\"direct backend response: hello\""));
         assert!(body.contains("event: message_stop"));
     }
 
     #[tokio::test]
-    async fn routes_anthropic_stream_uses_provider_token_stream_before_completion() {
+    async fn routes_anthropic_stream_medium_preserves_full_orchestration_before_completion() {
         let provider = std::sync::Arc::new(StreamingProbeProvider::default());
         let app = build_router_with_provider(provider.clone());
         let response = tower::ServiceExt::oneshot(
@@ -14831,10 +15459,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(provider.invoke_calls(), 0);
-        assert_eq!(provider.stream_calls(), 1);
-        let first_text = first_stream_text(response).await;
-        assert!(first_text.contains("stream-token-1"));
+        let body = response_text(response).await;
+        assert_eq!(provider.invoke_calls(), 18);
+        assert_eq!(provider.stream_calls(), 0);
+        assert!(body.starts_with(": miya orchestration active"));
+        assert!(body.contains("non-stream fallback"));
     }
 
     #[tokio::test]
@@ -14873,7 +15502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_anthropic_stream_tool_use_returns_sse_tool_use() {
+    async fn routes_anthropic_direct_stream_tool_use_returns_sse_tool_use() {
         let app = build_router();
         let response = tower::ServiceExt::oneshot(
             app,
@@ -14886,6 +15515,7 @@ mod tests {
                         "model": "mock",
                         "max_tokens": 256,
                         "stream": true,
+                        "reasoning_effort": "none",
                         "messages": [{"role": "user", "content": "please use a tool"}]
                     })
                     .to_string(),
@@ -14903,27 +15533,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_anthropic_stream_tool_delta_overrides_stop_reason() {
-        let app = build_router_with_provider(std::sync::Arc::new(StopAfterToolStreamProvider));
-        let response = tower::ServiceExt::oneshot(
-            app,
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "model": "mock",
-                        "max_tokens": 256,
-                        "stream": true,
-                        "messages": [{"role": "user", "content": "tool"}]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    async fn anthropic_provider_stream_tool_delta_overrides_stop_reason() {
+        let provider = StopAfterToolStreamProvider;
+        let provider_stream = provider.stream(provider_probe_request()).await.unwrap();
+        let response = format_anthropic_provider_stream_response(
+            "mock".to_string(),
+            provider_stream,
+            direct_telemetry_context(
+                "test.anthropic_stream",
+                "mock".to_string(),
+                "anthropic_messages",
+                &RequestContext::default(),
+                true,
+                None,
+            ),
+        );
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = response_text(response).await;
@@ -15563,12 +16187,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_level_orchestration_admission_rejects_overload_before_partial_execution() {
+        let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
+        let mut state = AppState::with_provider(provider);
+        state.orchestration_admission = OrchestrationAdmission::with_limit_and_parallelism(
+            1,
+            1,
+            Duration::from_millis(10),
+            state.metrics.clone(),
+        );
+        let metrics = state.metrics.clone();
+        let app = build_router_with_state(state);
+        let request = |text: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "mock",
+                        "reasoning_effort": "medium",
+                        "messages": [{"role": "user", "content": text}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let (first, second) = tokio::join!(
+            tower::ServiceExt::oneshot(app.clone(), request("first full orchestration")),
+            tower::ServiceExt::oneshot(app, request("second full orchestration"))
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let (ok, overloaded) = if first.status() == StatusCode::OK {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        let error = response_json(overloaded).await;
+        assert_eq!(error["error"]["code"], "orchestration_overloaded");
+        assert_eq!(error["error"]["retry_after_ms"], 10);
+        assert_eq!(
+            metrics.orchestration_queue_timeouts.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.orchestrations_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn provider_admission_limits_concurrency_across_requests() {
         let provider = std::sync::Arc::new(ConcurrentProbeProvider::default());
         let managed: Arc<dyn ModelProvider> = Arc::new(AdmissionProvider {
             inner: provider.clone(),
             admission: ProviderAdmission {
                 semaphore: Some(Arc::new(Semaphore::new(1))),
+                max_concurrent: Some(1),
                 wait_timeout: Duration::from_secs(5),
             },
         });
@@ -16301,25 +16978,6 @@ mod tests {
                 }),
             ])))
         }
-    }
-
-    async fn first_stream_text(response: axum::response::Response) -> String {
-        use futures::StreamExt;
-
-        let mut stream = response.into_body().into_data_stream();
-        let mut body = String::new();
-        for _ in 0..4 {
-            let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
-                .await
-                .expect("stream did not yield early")
-                .expect("stream ended before text")
-                .expect("stream chunk failed");
-            body.push_str(std::str::from_utf8(&chunk).unwrap());
-            if body.contains("stream-token-1") {
-                return body;
-            }
-        }
-        body
     }
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {

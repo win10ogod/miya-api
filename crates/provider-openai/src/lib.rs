@@ -132,10 +132,10 @@ impl OpenAiProvider {
             .and_then(|content| parse_structured_or_text(scope, task_id, content))
         {
             response.artifacts.push(artifact);
-        } else if let Some(artifact) = message
-            .get("reasoning")
-            .and_then(|reasoning| reasoning.as_str())
-            .and_then(extract_final_answer_from_reasoning)
+        } else if let Some(artifact) = ["reasoning", "reasoning_content"]
+            .into_iter()
+            .filter_map(|field| message.get(field).and_then(|reasoning| reasoning.as_str()))
+            .find_map(extract_final_answer_from_reasoning)
             .and_then(|content| parse_structured_or_text(scope, task_id, &content))
         {
             response.artifacts.push(artifact);
@@ -1901,6 +1901,31 @@ mod tests {
         assert_eq!(text, "系統提示生效：這是可直接給使用者的答案。");
         assert!(!text.contains("Analyze the user request"));
         assert!(!text.contains("reasoning"));
+    }
+
+    #[test]
+    fn openai_response_recovers_marked_final_from_qwen_reasoning_content() {
+        let scope = IsolationKey::new("tenant", "request", "conversation");
+        let task_id = TaskId::from("root");
+        let response = OpenAiProvider::parse_response(
+            &scope,
+            &task_id,
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "reasoning_content": "Private analysis must stay hidden. Final answer: `QWEN_FINAL_OK`"
+                    }
+                }]
+            }),
+        )
+        .unwrap();
+
+        let AgentArtifact::Text { text, .. } = &response.artifacts[0] else {
+            panic!("expected text artifact");
+        };
+        assert_eq!(text, "QWEN_FINAL_OK");
+        assert!(!text.contains("Private analysis"));
     }
 
     #[test]

@@ -13,6 +13,10 @@ param(
     [int]$MaxParallelAgents = 4,
     [int]$ProviderMaxConcurrent = 64,
     [int]$ProviderQueueTimeoutMs = 30000,
+    [int]$ProviderTimeoutSec = 300,
+    [int]$ProviderConnectTimeoutSec = 30,
+    [int]$MaxConcurrentOrchestrations = 0,
+    [int]$OrchestrationQueueTimeoutMs = 30000,
     [int]$ProviderMaxRetries = 2,
     [int]$ProviderRetryBaseMs = 250,
     [int]$ProviderCircuitFailureThreshold = 5,
@@ -89,6 +93,14 @@ $env:MIYA_TENANT_QUEUE_TIMEOUT_MS = [string]$TenantQueueTimeoutMs
 $env:MULTI_AGENT_MAX_PARALLEL_AGENTS = [string]$MaxParallelAgents
 $env:MIYA_PROVIDER_MAX_CONCURRENT = [string]$ProviderMaxConcurrent
 $env:MIYA_PROVIDER_QUEUE_TIMEOUT_MS = [string]$ProviderQueueTimeoutMs
+$env:MIYA_PROVIDER_TIMEOUT_SECS = [string]$ProviderTimeoutSec
+$env:MIYA_PROVIDER_CONNECT_TIMEOUT_SECS = [string]$ProviderConnectTimeoutSec
+if ($MaxConcurrentOrchestrations -gt 0) {
+    $env:MIYA_MAX_CONCURRENT_ORCHESTRATIONS = [string]$MaxConcurrentOrchestrations
+} else {
+    Remove-Item Env:MIYA_MAX_CONCURRENT_ORCHESTRATIONS -ErrorAction SilentlyContinue
+}
+$env:MIYA_ORCHESTRATION_QUEUE_TIMEOUT_MS = [string]$OrchestrationQueueTimeoutMs
 $env:MIYA_PROVIDER_MAX_RETRIES = [string]$ProviderMaxRetries
 $env:MIYA_PROVIDER_RETRY_BASE_MS = [string]$ProviderRetryBaseMs
 $env:MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD = [string]$ProviderCircuitFailureThreshold
@@ -106,6 +118,14 @@ if ($OtlpEndpoint) {
     Remove-Item Env:OTEL_EXPORTER_OTLP_ENDPOINT -ErrorAction SilentlyContinue
 }
 $env:MIYA_PUBLIC_REASONING = $PublicReasoning
+
+if ($AgentTimeoutMs -lt ($ProviderTimeoutSec * 1000)) {
+    Write-Warning "AgentTimeoutMs ($AgentTimeoutMs) is shorter than ProviderTimeoutSec ($ProviderTimeoutSec sec); slow reasoning calls will be cancelled before the provider timeout."
+}
+if ($RequestTimeoutMs -lt ($AgentTimeoutMs * 3)) {
+    Write-Warning "RequestTimeoutMs ($RequestTimeoutMs) is too short for a full-latency planner, worker wave, and synthesizer; high/xhigh may end before final text."
+}
+
 if ($TrainingTrace) {
     $env:TRAINING_TRACE = "enabled"
     $env:TRAINING_TRACE_PATH = $TrainingTracePath
@@ -144,7 +164,10 @@ Write-Host "Gemma-formatted models: $env:MIYA_GEMMA_MODELS"
 Write-Host "Tenant max concurrent requests: $TenantMaxConcurrentRequests; queue timeout=$TenantQueueTimeoutMs ms"
 Write-Host "Max parallel agents: $MaxParallelAgents"
 Write-Host "Provider max concurrent calls: $ProviderMaxConcurrent"
+Write-Host "Provider HTTP/connect timeout: $ProviderTimeoutSec/$ProviderConnectTimeoutSec sec"
 Write-Host "Provider queue timeout: $ProviderQueueTimeoutMs ms"
+$OrchestrationLimitText = if ($MaxConcurrentOrchestrations -gt 0) { [string]$MaxConcurrentOrchestrations } else { "auto(provider/max-parallel)" }
+Write-Host "Orchestration admission: $OrchestrationLimitText; queue timeout=$OrchestrationQueueTimeoutMs ms"
 Write-Host "Provider retries/circuit: $ProviderMaxRetries retries, threshold=$ProviderCircuitFailureThreshold cooldown=$ProviderCircuitCooldownMs ms"
 Write-Host "Request/agent timeout: $RequestTimeoutMs/$AgentTimeoutMs ms"
 Write-Host "Orchestration SSE heartbeat: $StreamHeartbeatSec sec"

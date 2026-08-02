@@ -36,7 +36,7 @@ Miya API 是一個以 Rust 實作的 OpenAI Responses、OpenAI Chat Completions 
 
 - 伺服器只代理或編排模型呼叫，不會在後端任意執行使用者定義工具。工具呼叫會以 OpenAI/Anthropic 相容格式回給前端，由前端或客戶端執行工具後再把 tool result 送回。
 - 高推理難度會增加可用 agent coverage 與模型規劃上限；token 用量會被記錄為 telemetry，不會作為阻止子代理生成的條件。
-- full multi-agent orchestration 的 streaming 會在完成 orchestration 後輸出相容 SSE；只有 `reasoning.effort=none` 與不需完整 orchestration 的 root path 會直接轉發 provider token streaming。
+- `low`、`medium`、`high`、`xhigh` 的 streaming 都會保留完整 4/16/32/64-agent orchestration，完成後輸出相容 SSE；只有明確的 `reasoning.effort=none` 走 direct provider streaming。等待完整 orchestration 時會持續送出 SSE comment heartbeat。
 
 ## Architecture
 
@@ -406,13 +406,17 @@ MULTI_AGENT_MAX_PARALLEL_AGENTS=4 \
 MIYA_TENANT_QUEUE_TIMEOUT_MS=30000 \
 MIYA_PROVIDER_MAX_CONCURRENT=64 \
 MIYA_PROVIDER_QUEUE_TIMEOUT_MS=30000 \
+MIYA_MAX_CONCURRENT_ORCHESTRATIONS=16 \
+MIYA_ORCHESTRATION_QUEUE_TIMEOUT_MS=30000 \
 MIYA_REQUEST_TIMEOUT_MS=3600000 \
 MIYA_AGENT_TIMEOUT_MS=330000 \
 MIYA_STREAM_HEARTBEAT_SECS=10 \
 cargo run -p api-server
 ```
 
-`MULTI_AGENT_MAX_PARALLEL_AGENTS` 限制單一 orchestration 的 child fan-out；`MIYA_PROVIDER_MAX_CONCURRENT` 是跨 request、跨 tenant、同時涵蓋 kernel 與 direct passthrough 的 process-wide provider admission limit。tenant 與 provider 排隊均有明確上限，超時回傳帶 `Retry-After` 的 `503`，agent/request 執行超時回傳 `504`。預設 timeout 已為慢速推理模型保留 330 秒單次 agent 與 60 分鐘完整 orchestration；用戶明確設定的 timeout 仍會原樣執行。完整 orchestration 的 SSE 每 10 秒送出標準 comment heartbeat，避免 proxy/load balancer 在模型思考期間因 idle timeout 中斷；heartbeat 不會偽造模型 token 或改變輸出。
+`MULTI_AGENT_MAX_PARALLEL_AGENTS` 限制單一 orchestration 的 child fan-out；`MIYA_PROVIDER_MAX_CONCURRENT` 是跨 request、跨 tenant、同時涵蓋 kernel 與 direct passthrough 的 process-wide provider admission limit。Miya 另在任何 planner/worker 開始前取得完整 orchestration admission；每個請求會依其有效 child parallelism 取得一個或多個加權 slots，避免大量 high/xhigh 請求各自占住部分 provider capacity 後一起 queue timeout。未明確設定 `MIYA_MAX_CONCURRENT_ORCHESTRATIONS` 時，其基準 slots 上限自動推導為 `floor(provider max concurrent / default max parallel agents)`，至少為 1；這只約束同時執行的完整請求，不會減少單一請求的 agent coverage。
+
+Tenant、orchestration 與 provider 排隊均有明確上限。Orchestration 過載回傳帶 `Retry-After` 的 `503 orchestration_overloaded`，provider admission 過載回傳 `503 provider_overloaded`，agent/request 執行超時回傳 `504`。預設 timeout 已為慢速推理模型保留 330 秒單次 agent 與 60 分鐘完整 orchestration；用戶明確設定的 timeout 仍會原樣執行。啟動時會輸出 `runtime_stability_profile`，並在 agent timeout 比 provider timeout 短、或總 request deadline 無法容納 planner/worker/synthesizer 的完整延遲窗口時發出 warning。完整 orchestration 的 SSE 每 10 秒送出標準 comment heartbeat，避免 proxy/load balancer 在模型思考期間因 idle timeout 中斷；heartbeat 不會偽造模型 token 或改變輸出。
 
 The same limit can be overridden per request:
 
@@ -863,6 +867,9 @@ TENANT_MAX_CONCURRENT_REQUESTS=16
 MIYA_TENANT_QUEUE_TIMEOUT_MS=30000
 MIYA_PROVIDER_MAX_CONCURRENT=64
 MIYA_PROVIDER_QUEUE_TIMEOUT_MS=30000
+MIYA_PROVIDER_TIMEOUT_SECS=300
+MIYA_PROVIDER_CONNECT_TIMEOUT_SECS=30
+MIYA_ORCHESTRATION_QUEUE_TIMEOUT_MS=30000
 MIYA_PROVIDER_MAX_RETRIES=2
 MIYA_PROVIDER_RETRY_BASE_MS=250
 MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD=5
@@ -923,6 +930,8 @@ cargo run -p api-server
 | `MULTI_AGENT_MAX_PARALLEL_AGENTS` | `4` | max concurrent child-agent provider calls; aliases: `MIYA_MAX_PARALLEL_AGENTS`, `MAX_PARALLEL_AGENTS` |
 | `MIYA_PROVIDER_MAX_CONCURRENT` | `64` | process-wide concurrent provider call limit shared by all tenants and direct/kernel paths; `0` disables |
 | `MIYA_PROVIDER_QUEUE_TIMEOUT_MS` | `30000` | maximum wait for a process-wide provider permit |
+| `MIYA_MAX_CONCURRENT_ORCHESTRATIONS` | auto: `max(1, provider concurrency / child parallelism)` | process-wide full-orchestration request admission; `0` disables this additional layer without changing per-request agent coverage |
+| `MIYA_ORCHESTRATION_QUEUE_TIMEOUT_MS` | `30000` | maximum wait before a full orchestration starts; overload returns `503 orchestration_overloaded` plus `Retry-After` before any partial agent execution |
 | `MIYA_PROVIDER_MAX_RETRIES` | `2` | retries after the initial attempt for retryable transport, 408/409/429, and 5xx failures; applies to kernel, direct, streaming setup, and batch paths |
 | `MIYA_PROVIDER_RETRY_BASE_MS` | `250` | exponential retry base delay; provider `Retry-After` takes precedence |
 | `MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD` | `5` | terminal retryable failures before opening the process-wide provider circuit |
@@ -969,7 +978,7 @@ Anthropic-compatible responses include:
 }
 ```
 
-The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`. `GET /metrics` exposes Prometheus counters for HTTP/provider attempts/retries/failures/circuit rejections, durable job start/finish/cancellation, and active orchestration streams/heartbeat delivery. HTTP requests accept W3C `traceparent`; setting `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP/gRPC export.
+The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`. `GET /metrics` exposes Prometheus counters/gauges for HTTP/provider attempts/retries/failures/circuit rejections, durable job lifecycle, orchestration admission limit/active/queued/admitted/queue-timeout/wait time, kernel request/agent timeouts, and active orchestration streams/heartbeat delivery. HTTP requests accept W3C `traceparent`; setting `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP/gRPC export.
 
 Telemetry fields include `route`, `model`, `tenant_id`, `request_id`, `conversation_fingerprint`, `reasoning_effort`, `stream`, `batch_index`, `direct_passthrough`, `input_tokens`, `output_tokens`, `total_tokens`, `provider_call_count`, `task_count`, `child_agent_count`, `tool_call_count`, `verification`, and optional context-cache details.
 
