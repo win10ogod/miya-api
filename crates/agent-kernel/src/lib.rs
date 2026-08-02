@@ -475,6 +475,7 @@ where
             Self::apply_provider_response(
                 &request_policy,
                 &scope,
+                &root_task,
                 &mut store,
                 &mut ledger,
                 &mut graph,
@@ -513,6 +514,7 @@ where
                 Self::apply_provider_response(
                     &request_policy,
                     &scope,
+                    &root_task,
                     &mut store,
                     &mut ledger,
                     &mut graph,
@@ -556,6 +558,7 @@ where
                         provider_options: planner_provider_options.clone(),
                     })
                     .await?;
+                normalize_over_target_orchestration_plans(&mut planner_response, &request_policy);
                 accumulate_usage(&mut usage, &mut provider_call_count, &planner_response);
                 trace_events.extend(trace_events_from_response(&planner_task, &planner_response));
                 let mut plan_coverage = planner_coverage(&planner_response);
@@ -572,7 +575,7 @@ where
                         repair_attempts + 1,
                     );
                     trace_events.push(trace_agent_input(&repair_task, repair_input.clone()));
-                    let repair_response = self
+                    let mut repair_response = self
                         .invoke_provider(ProviderRequest {
                             scope: scope.clone(),
                             task: repair_task.clone(),
@@ -591,6 +594,10 @@ where
                             provider_options: planner_provider_options.clone(),
                         })
                         .await?;
+                    normalize_over_target_orchestration_plans(
+                        &mut repair_response,
+                        &request_policy,
+                    );
                     accumulate_usage(&mut usage, &mut provider_call_count, &repair_response);
                     trace_events.extend(trace_events_from_response(&repair_task, &repair_response));
                     let repair_coverage = planner_coverage(&repair_response);
@@ -653,6 +660,7 @@ where
                     Self::apply_provider_response(
                         &request_policy,
                         &scope,
+                        &root_task,
                         &mut store,
                         &mut ledger,
                         &mut graph,
@@ -737,6 +745,7 @@ where
             Self::apply_provider_response(
                 &request_policy,
                 &scope,
+                &task,
                 &mut store,
                 &mut ledger,
                 &mut graph,
@@ -795,6 +804,7 @@ where
             Self::apply_provider_response(
                 &request_policy,
                 &scope,
+                &root_continuation_task,
                 &mut store,
                 &mut ledger,
                 &mut graph,
@@ -1248,9 +1258,11 @@ where
         .map_err(KernelError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_provider_response(
         policy: &KernelPolicy,
         scope: &IsolationKey,
+        task: &SubtaskSpec,
         store: &mut ArtifactStore,
         ledger: &mut ToolLedger,
         graph: &mut TaskGraph,
@@ -1271,9 +1283,36 @@ where
 
         for artifact in response.artifacts {
             match artifact {
-                AgentArtifact::SpawnPlan { plan, .. } => {
-                    SpawnValidator::new(policy.clone())
-                        .validate_and_apply(scope, store, graph, &plan)?;
+                AgentArtifact::SpawnPlan {
+                    id,
+                    scope: artifact_scope,
+                    plan,
+                } if !task.allowed_capabilities.contains(&Capability::Spawn) => {
+                    let artifact = AgentArtifact::Text {
+                        id,
+                        scope: artifact_scope,
+                        text: serde_json::to_string(&json!({
+                            "type": "spawn_plan",
+                            "plan": plan
+                        }))
+                        .unwrap_or_else(|_| "worker returned a disallowed spawn plan".to_string()),
+                    };
+                    store.insert(artifact.clone());
+                    text_artifacts.push(artifact);
+                }
+                AgentArtifact::SpawnPlan { mut plan, .. } => {
+                    let existing_agents = graph
+                        .tasks
+                        .values()
+                        .filter(|task| task.parent_task_id.is_some())
+                        .count();
+                    let remaining = usize::from(policy.limits.max_agents_per_request)
+                        .saturating_sub(existing_agents);
+                    plan.children.truncate(remaining);
+                    if !plan.children.is_empty() {
+                        SpawnValidator::new(policy.clone())
+                            .validate_and_apply(scope, store, graph, &plan)?;
+                    }
                 }
                 AgentArtifact::Text { .. } => {
                     store.insert(artifact.clone());
@@ -1932,9 +1971,22 @@ fn planner_coverage(response: &ProviderResponse) -> PlannerCoverage {
     }
 }
 
+fn normalize_over_target_orchestration_plans(
+    response: &mut ProviderResponse,
+    policy: &KernelPolicy,
+) {
+    let mut remaining = usize::from(policy.limits.max_agents_per_request);
+    for artifact in &mut response.artifacts {
+        if let AgentArtifact::SpawnPlan { plan, .. } = artifact {
+            plan.children.truncate(remaining);
+            remaining = remaining.saturating_sub(plan.children.len());
+        }
+    }
+}
+
 fn should_repair_orchestration_plan(coverage: &PlannerCoverage, policy: &KernelPolicy) -> bool {
     let target = usize::from(policy.limits.max_agents_per_request);
-    target > 1 && (!coverage.saw_plan || coverage.child_count < target)
+    target > 1 && (!coverage.saw_plan || coverage.child_count != target)
 }
 
 fn orchestration_planner_task(root_task_id: &TaskId, policy: &KernelPolicy) -> SubtaskSpec {
@@ -2028,7 +2080,7 @@ fn orchestration_planner_repair_input(
         "You are repairing the orchestration plan for this same single API request.\n\
          Repair attempt: {attempt}/{max_attempts}.\n\
          Previous orchestration attempt:\n{previous}\n\n\
-         The previous attempt was missing, empty, or below the configured coverage tier.\n\
+         The previous attempt was missing, empty, or did not match the configured coverage tier.\n\
          Return ONLY valid JSON for one complete replacement spawn_plan. The kernel will apply only this repaired plan.\n\
          Keep the division model-selected and task-specific; do not use generic template workers.\n\
          Keep each child objective short, ideally 12 words or fewer.\n\
@@ -2691,6 +2743,85 @@ mod tests {
     }
 
     #[test]
+    fn planner_plan_is_bounded_to_the_exact_configured_agent_count() {
+        let scope = IsolationKey::new("tenant", "request-a", "conversation");
+        let mut response = ProviderResponse {
+            artifacts: vec![AgentArtifact::SpawnPlan {
+                id: ArtifactId::from("oversized-plan"),
+                scope,
+                plan: SpawnPlan {
+                    parent_task_id: TaskId::from("root"),
+                    reason: "model returned one extra child".to_string(),
+                    children: model_children("planned", 33, "coverage slice"),
+                    expected_artifacts: vec![ArtifactKind::Text],
+                    budget_request: BudgetRequest {
+                        max_tokens: 4096,
+                        max_tool_calls: 0,
+                    },
+                },
+            }],
+            tool_calls: vec![],
+            usage: ProviderUsage::default(),
+        };
+        let policy = KernelPolicy::default().with_reasoning_effort(&ReasoningEffort::High);
+
+        normalize_over_target_orchestration_plans(&mut response, &policy);
+
+        let coverage = planner_coverage(&response);
+        assert!(coverage.saw_plan);
+        assert_eq!(coverage.child_count, 32);
+        assert!(!should_repair_orchestration_plan(&coverage, &policy));
+    }
+
+    #[test]
+    fn text_only_worker_cannot_add_an_accidental_extra_agent() {
+        let scope = IsolationKey::new("tenant", "request-a", "conversation");
+        let root = TaskId::from("root");
+        let task = model_child("worker-32", "return a worker finding");
+        let mut store = ArtifactStore::new();
+        let mut ledger = ToolLedger::new();
+        let mut graph = TaskGraph::new(root.clone());
+        let mut text_artifacts = Vec::new();
+        let response = ProviderResponse {
+            artifacts: vec![AgentArtifact::SpawnPlan {
+                id: ArtifactId::from("worker-accidental-plan"),
+                scope: scope.clone(),
+                plan: SpawnPlan {
+                    parent_task_id: root.clone(),
+                    reason: "worker accidentally proposed another agent".to_string(),
+                    children: vec![model_child("agent-33", "unexpected extra work")],
+                    expected_artifacts: vec![ArtifactKind::Text],
+                    budget_request: BudgetRequest {
+                        max_tokens: 2048,
+                        max_tool_calls: 0,
+                    },
+                },
+            }],
+            tool_calls: vec![],
+            usage: ProviderUsage::default(),
+        };
+
+        KernelRunner::<MockProvider>::apply_provider_response(
+            &KernelPolicy::default(),
+            &scope,
+            &task,
+            &mut store,
+            &mut ledger,
+            &mut graph,
+            &mut text_artifacts,
+            response,
+        )
+        .unwrap();
+
+        assert!(graph.tasks.is_empty());
+        assert_eq!(text_artifacts.len(), 1);
+        assert!(matches!(
+            &text_artifacts[0],
+            AgentArtifact::Text { text, .. } if text.contains("spawn_plan")
+        ));
+    }
+
+    #[test]
     fn valid_spawn_plan_expands_graph() {
         let scope = IsolationKey::new("tenant", "request-a", "conversation");
         let root = TaskId::from("root");
@@ -3091,6 +3222,27 @@ mod tests {
 
         assert!(matches!(error, KernelError::ProviderRejected(message)
             if message.contains("refusing root-only fallback")));
+    }
+
+    #[tokio::test]
+    async fn high_effort_accepts_a_33_child_model_plan_without_exceeding_32() {
+        let mut request = text_request("exercise all high-effort coverage slices");
+        request.reasoning_effort = ReasoningEffort::High;
+        let runner = KernelRunner::new(OverTargetPlannerProvider, KernelPolicy::default());
+
+        let output = runner.run(request).await.unwrap();
+
+        assert!(output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 32);
+        assert_eq!(
+            output
+                .task_graph
+                .tasks
+                .values()
+                .filter(|task| task.role == AgentRole::Worker)
+                .count(),
+            32
+        );
     }
 
     #[tokio::test]
@@ -3808,25 +3960,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_effort_low_limits_request_to_four_agents() {
+    async fn reasoning_effort_low_bounds_an_oversized_plan_to_four_agents() {
         let mut request = text_request("spawn five children");
         request.reasoning_effort = ReasoningEffort::Low;
-        request.tools = vec![ToolDefinition {
-            name: "lookup".to_string(),
-            description: Some("public client tool".to_string()),
-            input_schema: serde_json::json!({"type": "object"}),
-        }];
         let runner = KernelRunner::new(FiveChildProvider, KernelPolicy::default());
 
-        let error = runner.run(request).await.unwrap_err();
+        let output = runner.run(request).await.unwrap();
 
-        assert!(matches!(
-            error,
-            KernelError::AgentLimitExceeded {
-                requested: 5,
-                max: 4
-            }
-        ));
+        assert!(output.verification.passed);
+        assert_eq!(output.encrypted_subagent_state.len(), 4);
     }
 
     #[tokio::test]
@@ -4413,6 +4555,61 @@ mod tests {
                 | AgentRole::ReasoningSummarizer
                 | AgentRole::Synthesizer
                 | AgentRole::Verifier => Ok(ProviderResponse::default()),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct OverTargetPlannerProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for OverTargetPlannerProvider {
+        async fn invoke(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            match request.task.role {
+                AgentRole::Leader if request.task.objective.contains("orchestration plan") => {
+                    Ok(ProviderResponse {
+                        artifacts: vec![AgentArtifact::SpawnPlan {
+                            id: ArtifactId::from("spawn-plan-33"),
+                            scope: request.scope,
+                            plan: SpawnPlan {
+                                parent_task_id: TaskId::from("root"),
+                                reason: "model accidentally returned one extra child".to_string(),
+                                children: model_children("high-child", 33, "high coverage slice"),
+                                expected_artifacts: vec![ArtifactKind::Text],
+                                budget_request: BudgetRequest {
+                                    max_tokens: 4096,
+                                    max_tool_calls: 0,
+                                },
+                            },
+                        }],
+                        tool_calls: vec![],
+                        usage: ProviderUsage::default(),
+                    })
+                }
+                AgentRole::Worker => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from(format!("text-{}", request.task.task_id.as_ref())),
+                        scope: request.scope,
+                        text: format!("completed {}", request.task.objective),
+                    }],
+                    tool_calls: vec![],
+                    usage: ProviderUsage::default(),
+                }),
+                AgentRole::Synthesizer => Ok(ProviderResponse {
+                    artifacts: vec![AgentArtifact::Text {
+                        id: ArtifactId::from("high-final"),
+                        scope: request.scope,
+                        text: "high effort completed".to_string(),
+                    }],
+                    tool_calls: vec![],
+                    usage: ProviderUsage::default(),
+                }),
+                AgentRole::Leader | AgentRole::ReasoningSummarizer | AgentRole::Verifier => {
+                    Ok(ProviderResponse::default())
+                }
             }
         }
     }

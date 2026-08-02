@@ -9,6 +9,7 @@ param(
     [string]$System = "Reply exactly OK.",
     [string]$LogPath = "",
     [string]$TrainingTracePath = "",
+    [int]$TimeoutSec = 3700,
     [switch]$ShowTrainingTrace,
     [switch]$RawResponse,
     [switch]$RawTelemetry
@@ -69,7 +70,7 @@ $Response = Invoke-RestMethod `
     -ContentType "application/json" `
     -Headers $Headers `
     -Body $Body `
-    -TimeoutSec 180
+    -TimeoutSec $TimeoutSec
 
 if ($RawResponse) {
     $Response | ConvertTo-Json -Depth 30

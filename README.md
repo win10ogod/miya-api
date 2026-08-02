@@ -403,14 +403,16 @@ Concurrency can be configured globally through environment variables:
 
 ```bash
 MULTI_AGENT_MAX_PARALLEL_AGENTS=4 \
+MIYA_TENANT_QUEUE_TIMEOUT_MS=30000 \
 MIYA_PROVIDER_MAX_CONCURRENT=64 \
 MIYA_PROVIDER_QUEUE_TIMEOUT_MS=30000 \
-MIYA_REQUEST_TIMEOUT_MS=60000 \
-MIYA_AGENT_TIMEOUT_MS=20000 \
+MIYA_REQUEST_TIMEOUT_MS=3600000 \
+MIYA_AGENT_TIMEOUT_MS=330000 \
+MIYA_STREAM_HEARTBEAT_SECS=10 \
 cargo run -p api-server
 ```
 
-`MULTI_AGENT_MAX_PARALLEL_AGENTS` 限制單一 orchestration 的 child fan-out；`MIYA_PROVIDER_MAX_CONCURRENT` 是跨 request、跨 tenant、同時涵蓋 kernel 與 direct passthrough 的 process-wide provider admission limit。排隊超時回傳 `503`，agent/request 執行超時回傳 `504`。
+`MULTI_AGENT_MAX_PARALLEL_AGENTS` 限制單一 orchestration 的 child fan-out；`MIYA_PROVIDER_MAX_CONCURRENT` 是跨 request、跨 tenant、同時涵蓋 kernel 與 direct passthrough 的 process-wide provider admission limit。tenant 與 provider 排隊均有明確上限，超時回傳帶 `Retry-After` 的 `503`，agent/request 執行超時回傳 `504`。預設 timeout 已為慢速推理模型保留 330 秒單次 agent 與 60 分鐘完整 orchestration；用戶明確設定的 timeout 仍會原樣執行。完整 orchestration 的 SSE 每 10 秒送出標準 comment heartbeat，避免 proxy/load balancer 在模型思考期間因 idle timeout 中斷；heartbeat 不會偽造模型 token 或改變輸出。
 
 The same limit can be overridden per request:
 
@@ -438,7 +440,7 @@ max_total_tool_calls=<N>
 token_accounting_reference=<N>
 ```
 
-The leader may spawn more child tasks than the concurrency limit. The kernel executes those children with bounded parallelism, sends multiple OpenAI/Anthropic-compatible provider calls in parallel, then restores stable task order before writing artifacts, accounting token/tool usage, sealing sub-agent state and invoking final synthesis.
+The leader may spawn more child tasks than the concurrency limit. The kernel executes those children with bounded parallelism, sends multiple OpenAI/Anthropic-compatible provider calls in parallel, then restores stable task order before writing artifacts, accounting token/tool usage, sealing sub-agent state and invoking final synthesis. If a model accidentally emits 33/34 planner children for the `high=32` contract, the kernel bounds the model plan to exactly 32 instead of failing the whole request. A text-only worker that returns `spawn_plan` JSON cannot mutate the task graph; its output is preserved as text. This enforces the advertised agent tier without reducing the requested 32-agent coverage.
 
 The test suite includes model-planned coverage evaluation proving that higher effort increases actual task coverage instead of only changing metadata:
 
@@ -856,14 +858,16 @@ OPENAI_BASE_URL=http://YOUR_BACKEND_HOST:PORT/v1
 OPENAI_API_KEY=local-key
 MIYA_API_KEY=miya-local-key
 TENANT_MAX_CONCURRENT_REQUESTS=16
+MIYA_TENANT_QUEUE_TIMEOUT_MS=30000
 MIYA_PROVIDER_MAX_CONCURRENT=64
 MIYA_PROVIDER_QUEUE_TIMEOUT_MS=30000
 MIYA_PROVIDER_MAX_RETRIES=2
 MIYA_PROVIDER_RETRY_BASE_MS=250
 MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD=5
 MIYA_PROVIDER_CIRCUIT_COOLDOWN_MS=30000
-MIYA_REQUEST_TIMEOUT_MS=60000
-MIYA_AGENT_TIMEOUT_MS=20000
+MIYA_REQUEST_TIMEOUT_MS=3600000
+MIYA_AGENT_TIMEOUT_MS=330000
+MIYA_STREAM_HEARTBEAT_SECS=10
 MIYA_DATA_DIR=.multi-agent-data
 MIYA_MAX_CONCURRENT_JOBS=4
 MIYA_BATCH_ITEM_CONCURRENCY=8
@@ -913,6 +917,7 @@ cargo run -p api-server
 | `CONTEXT_STORE` | enabled | set to `disabled` to disable SurrealKV context |
 | `CONTEXT_STORE_PATH` | `.multi-agent-context/surrealkv` | SurrealKV storage path |
 | `TENANT_MAX_CONCURRENT_REQUESTS` | `16` in env-built router | per-tenant concurrency cap; `0` disables |
+| `MIYA_TENANT_QUEUE_TIMEOUT_MS` | `30000` | bounded wait for a per-tenant request slot; overload returns `503` plus `Retry-After` instead of hanging indefinitely |
 | `MULTI_AGENT_MAX_PARALLEL_AGENTS` | `4` | max concurrent child-agent provider calls; aliases: `MIYA_MAX_PARALLEL_AGENTS`, `MAX_PARALLEL_AGENTS` |
 | `MIYA_PROVIDER_MAX_CONCURRENT` | `64` | process-wide concurrent provider call limit shared by all tenants and direct/kernel paths; `0` disables |
 | `MIYA_PROVIDER_QUEUE_TIMEOUT_MS` | `30000` | maximum wait for a process-wide provider permit |
@@ -920,9 +925,10 @@ cargo run -p api-server
 | `MIYA_PROVIDER_RETRY_BASE_MS` | `250` | exponential retry base delay; provider `Retry-After` takes precedence |
 | `MIYA_PROVIDER_CIRCUIT_FAILURE_THRESHOLD` | `5` | terminal retryable failures before opening the process-wide provider circuit |
 | `MIYA_PROVIDER_CIRCUIT_COOLDOWN_MS` | `30000` | circuit-open cooldown before one half-open probe |
-| `MIYA_REQUEST_TIMEOUT_MS` | `60000` | total kernel request timeout |
-| `MIYA_AGENT_TIMEOUT_MS` | `20000` | timeout for each planner/worker/root/synthesizer call |
+| `MIYA_REQUEST_TIMEOUT_MS` | `3600000` | total kernel request timeout; sized for full high/xhigh slow-model orchestration |
+| `MIYA_AGENT_TIMEOUT_MS` | `330000` | timeout for each planner/worker/root/synthesizer/verifier call, slightly above the default upstream HTTP timeout |
 | `MIYA_PROVIDER_TIMEOUT_SECS` | `300` | HTTP request timeout for provider adapters and direct passthrough |
+| `MIYA_STREAM_HEARTBEAT_SECS` | `10` | SSE comment heartbeat interval while full orchestration is still running; does not alter model output |
 | `MIYA_PROVIDER_CONNECT_TIMEOUT_SECS` | `30` | provider connect timeout |
 | `MIYA_DATA_DIR` | `.multi-agent-data` | durable object/blob root for files, batches, Message Batches, background Response payloads, and fallback response state |
 | `MIYA_MAX_CONCURRENT_JOBS` | `4` | concurrent durable jobs; does not reduce each request's agent coverage |
@@ -961,7 +967,7 @@ Anthropic-compatible responses include:
 }
 ```
 
-The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`. `GET /metrics` exposes Prometheus counters for provider attempts/retries/failures/circuit rejections and durable job start/finish/cancellation. HTTP requests accept W3C `traceparent`; setting `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP/gRPC export.
+The backend also emits compact JSONL records to stdout with `event: "api_usage"`. The Windows launcher redirects these records to `logs\api-server.out.log`. `GET /metrics` exposes Prometheus counters for HTTP/provider attempts/retries/failures/circuit rejections, durable job start/finish/cancellation, and active orchestration streams/heartbeat delivery. HTTP requests accept W3C `traceparent`; setting `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP/gRPC export.
 
 Telemetry fields include `route`, `model`, `tenant_id`, `request_id`, `conversation_fingerprint`, `reasoning_effort`, `stream`, `batch_index`, `direct_passthrough`, `input_tokens`, `output_tokens`, `total_tokens`, `provider_call_count`, `task_count`, `child_agent_count`, `tool_call_count`, `verification`, and optional context-cache details.
 

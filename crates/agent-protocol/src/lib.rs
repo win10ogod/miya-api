@@ -76,8 +76,8 @@ impl Default for ExecutionLimits {
             max_total_tool_calls: 16,
             max_tokens_per_agent: 2_048,
             max_total_tokens: 16_384,
-            request_timeout_ms: 60_000,
-            agent_timeout_ms: 20_000,
+            request_timeout_ms: 3_600_000,
+            agent_timeout_ms: 330_000,
         }
     }
 }
@@ -94,7 +94,7 @@ impl Default for AgentLimits {
         Self {
             max_tokens: 2_048,
             max_tool_calls: 4,
-            timeout_ms: 20_000,
+            timeout_ms: 330_000,
         }
     }
 }

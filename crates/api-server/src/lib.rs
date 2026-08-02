@@ -13,7 +13,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -51,7 +51,7 @@ use provider_openai::OpenAiProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -62,6 +62,7 @@ const MAX_OPENAI_FILE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_OPENAI_BATCH_FILE_BYTES: usize = 200 * 1024 * 1024;
 const DEFAULT_TENANT_ID: &str = "default";
 const DEFAULT_TENANT_MAX_CONCURRENT_REQUESTS: usize = 16;
+const DEFAULT_TENANT_QUEUE_TIMEOUT_MS: u64 = 30_000;
 const OPENAI_FILES_NAMESPACE: &str = "openai_files";
 const OPENAI_FILE_BLOBS_NAMESPACE: &str = "openai_file_blobs";
 const OPENAI_BATCHES_NAMESPACE: &str = "openai_batches";
@@ -607,6 +608,8 @@ pub struct RuntimeMetrics {
     http_requests: Arc<AtomicU64>,
     http_failures: Arc<AtomicU64>,
     http_latency_micros: Arc<AtomicU64>,
+    orchestration_streams_active: Arc<AtomicU64>,
+    orchestration_stream_heartbeats: Arc<AtomicU64>,
     provider_attempts: Arc<AtomicU64>,
     provider_retries: Arc<AtomicU64>,
     provider_failures: Arc<AtomicU64>,
@@ -623,6 +626,8 @@ impl RuntimeMetrics {
                 "# TYPE miya_http_requests_total counter\nmiya_http_requests_total {}\n",
                 "# TYPE miya_http_failures_total counter\nmiya_http_failures_total {}\n",
                 "# TYPE miya_http_request_duration_microseconds_total counter\nmiya_http_request_duration_microseconds_total {}\n",
+                "# TYPE miya_orchestration_streams_active gauge\nmiya_orchestration_streams_active {}\n",
+                "# TYPE miya_orchestration_stream_heartbeats_total counter\nmiya_orchestration_stream_heartbeats_total {}\n",
                 "# TYPE miya_provider_attempts_total counter\nmiya_provider_attempts_total {}\n",
                 "# TYPE miya_provider_retries_total counter\nmiya_provider_retries_total {}\n",
                 "# TYPE miya_provider_failures_total counter\nmiya_provider_failures_total {}\n",
@@ -634,6 +639,8 @@ impl RuntimeMetrics {
             self.http_requests.load(Ordering::Relaxed),
             self.http_failures.load(Ordering::Relaxed),
             self.http_latency_micros.load(Ordering::Relaxed),
+            self.orchestration_streams_active.load(Ordering::Relaxed),
+            self.orchestration_stream_heartbeats.load(Ordering::Relaxed),
             self.provider_attempts.load(Ordering::Relaxed),
             self.provider_retries.load(Ordering::Relaxed),
             self.provider_failures.load(Ordering::Relaxed),
@@ -1560,57 +1567,83 @@ fn env_flag_enabled(value: &str) -> bool {
 #[derive(Clone)]
 struct TenantConcurrencyLimiter {
     max_per_tenant: Option<usize>,
-    semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    wait_timeout: Duration,
+    semaphores: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
 }
 
 impl TenantConcurrencyLimiter {
     fn disabled() -> Self {
         Self {
             max_per_tenant: None,
+            wait_timeout: Duration::from_millis(DEFAULT_TENANT_QUEUE_TIMEOUT_MS),
             semaphores: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn with_max_per_tenant(max_per_tenant: usize) -> Self {
+        Self::with_max_per_tenant_and_wait(
+            max_per_tenant,
+            Duration::from_millis(DEFAULT_TENANT_QUEUE_TIMEOUT_MS),
+        )
+    }
+
+    fn with_max_per_tenant_and_wait(max_per_tenant: usize, wait_timeout: Duration) -> Self {
         if max_per_tenant == 0 {
             return Self::disabled();
         }
         Self {
             max_per_tenant: Some(max_per_tenant),
+            wait_timeout,
             semaphores: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn from_env() -> Self {
         let env_value = std::env::var("TENANT_MAX_CONCURRENT_REQUESTS").ok();
-        Self::from_env_value(env_value.as_deref())
+        let wait_timeout_ms = std::env::var("MIYA_TENANT_QUEUE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_TENANT_QUEUE_TIMEOUT_MS);
+        Self::from_env_values(env_value.as_deref(), wait_timeout_ms)
     }
 
-    fn from_env_value(value: Option<&str>) -> Self {
+    fn from_env_values(value: Option<&str>, wait_timeout_ms: u64) -> Self {
         let max = value
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(DEFAULT_TENANT_MAX_CONCURRENT_REQUESTS);
-        Self::with_max_per_tenant(max)
+        Self::with_max_per_tenant_and_wait(max, Duration::from_millis(wait_timeout_ms.max(1)))
     }
 
-    async fn acquire(&self, tenant_id: &TenantId) -> Result<TenantConcurrencyPermit, String> {
+    async fn acquire(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<TenantConcurrencyPermit, ProviderError> {
         let Some(max_per_tenant) = self.max_per_tenant else {
             return Ok(TenantConcurrencyPermit { _permit: None });
         };
         let semaphore = {
-            let mut semaphores = self
-                .semaphores
-                .lock()
-                .map_err(|_| "tenant concurrency limiter lock poisoned".to_string())?;
-            semaphores
-                .entry(tenant_id.as_ref().to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(max_per_tenant)))
-                .clone()
+            let mut semaphores = self.semaphores.lock().map_err(|_| {
+                ProviderError::Rejected("tenant concurrency limiter lock poisoned".to_string())
+            })?;
+            semaphores.retain(|_, semaphore| semaphore.strong_count() > 0);
+            let tenant_key = tenant_id.as_ref().to_string();
+            if let Some(semaphore) = semaphores.get(&tenant_key).and_then(Weak::upgrade) {
+                semaphore
+            } else {
+                let semaphore = Arc::new(Semaphore::new(max_per_tenant));
+                semaphores.insert(tenant_key, Arc::downgrade(&semaphore));
+                semaphore
+            }
         };
-        let permit = semaphore
-            .acquire_owned()
+        let permit = tokio::time::timeout(self.wait_timeout, semaphore.acquire_owned())
             .await
-            .map_err(|_| "tenant concurrency limiter was closed".to_string())?;
+            .map_err(|_| ProviderError::QueueTimeout {
+                wait_ms: self.wait_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            })?
+            .map_err(|_| {
+                ProviderError::Rejected("tenant concurrency limiter was closed".to_string())
+            })?;
         Ok(TenantConcurrencyPermit {
             _permit: Some(permit),
         })
@@ -3596,7 +3629,7 @@ async fn completions(
     let tenant_id = request_context.tenant_id();
     let tenant_permit = match state.tenant_limiter.acquire(&tenant_id).await {
         Ok(permit) => permit,
-        Err(error) => return internal_error_response(error),
+        Err(error) => return provider_error_response(error),
     };
     let model = request.model.clone();
     let mut normalized = match normalize_openai_chat_with_context(request, &request_context) {
@@ -3627,38 +3660,48 @@ async fn completions(
         };
     }
 
-    match state.kernel.run(normalized).await {
-        Ok(output) => {
-            let context_report =
-                match finalize_context_report(&state.context, &prepared_context, &output).await {
-                    Ok(report) => report,
-                    Err(error) => return internal_error_response(error),
-                };
-            emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
-            if let Err(error) = state
-                .training_trace
-                .record_kernel(training_request.as_ref(), &output)
-            {
-                log_training_trace_error(error);
-            }
-            if stream {
-                return format_openai_completion_stream_response(
+    let metrics = state.metrics.clone();
+    let response_future = async move {
+        let _tenant_permit = tenant_permit;
+        match state.kernel.run(normalized).await {
+            Ok(output) => {
+                let context_report =
+                    match finalize_context_report(&state.context, &prepared_context, &output).await
+                    {
+                        Ok(report) => report,
+                        Err(error) => return internal_error_response(error),
+                    };
+                emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
+                if let Err(error) = state
+                    .training_trace
+                    .record_kernel(training_request.as_ref(), &output)
+                {
+                    log_training_trace_error(error);
+                }
+                if stream {
+                    return format_openai_completion_stream_response(
+                        model,
+                        output,
+                        include_public_reasoning,
+                        thinking_format,
+                    );
+                }
+                let mut response = format_openai_completion_response(
                     model,
                     output,
                     include_public_reasoning,
                     thinking_format,
                 );
+                attach_context_report(&mut response, prepared_context.as_ref(), context_report);
+                Json(response).into_response()
             }
-            let mut response = format_openai_completion_response(
-                model,
-                output,
-                include_public_reasoning,
-                thinking_format,
-            );
-            attach_context_report(&mut response, prepared_context.as_ref(), context_report);
-            Json(response).into_response()
+            Err(error) => kernel_error_response(error),
         }
-        Err(error) => kernel_error_response(error),
+    };
+    if stream {
+        orchestration_sse_response(response_future, metrics)
+    } else {
+        response_future.await
     }
 }
 
@@ -3681,7 +3724,7 @@ async fn chat_completions(
     let tenant_id = request_context.tenant_id();
     let tenant_permit = match state.tenant_limiter.acquire(&tenant_id).await {
         Ok(permit) => permit,
-        Err(error) => return internal_error_response(error),
+        Err(error) => return provider_error_response(error),
     };
     let direct_training_request = state
         .training_trace
@@ -3749,41 +3792,51 @@ async fn chat_completions(
         };
     }
 
-    match state.kernel.run(normalized).await {
-        Ok(output) => {
-            let context_report =
-                match finalize_context_report(&state.context, &prepared_context, &output).await {
-                    Ok(report) => report,
-                    Err(error) => return internal_error_response(error),
-                };
-            emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
-            if let Err(error) = state
-                .training_trace
-                .record_kernel(training_request.as_ref(), &output)
-            {
-                log_training_trace_error(error);
-            }
-            if stream {
-                return format_openai_stream_response(
+    let metrics = state.metrics.clone();
+    let response_future = async move {
+        let _tenant_permit = tenant_permit;
+        match state.kernel.run(normalized).await {
+            Ok(output) => {
+                let context_report =
+                    match finalize_context_report(&state.context, &prepared_context, &output).await
+                    {
+                        Ok(report) => report,
+                        Err(error) => return internal_error_response(error),
+                    };
+                emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
+                if let Err(error) = state
+                    .training_trace
+                    .record_kernel(training_request.as_ref(), &output)
+                {
+                    log_training_trace_error(error);
+                }
+                if stream {
+                    return format_openai_stream_response(
+                        model,
+                        output,
+                        &response_tool_names,
+                        tool_response_format,
+                        include_public_reasoning,
+                    );
+                }
+                let mut response = format_openai_response(
                     model,
                     output,
                     &response_tool_names,
+                    include_encrypted_state,
                     tool_response_format,
                     include_public_reasoning,
                 );
+                attach_context_report(&mut response, prepared_context.as_ref(), context_report);
+                Json(response).into_response()
             }
-            let mut response = format_openai_response(
-                model,
-                output,
-                &response_tool_names,
-                include_encrypted_state,
-                tool_response_format,
-                include_public_reasoning,
-            );
-            attach_context_report(&mut response, prepared_context.as_ref(), context_report);
-            Json(response).into_response()
+            Err(error) => kernel_error_response(error),
         }
-        Err(error) => kernel_error_response(error),
+    };
+    if stream {
+        orchestration_sse_response(response_future, metrics)
+    } else {
+        response_future.await
     }
 }
 
@@ -3810,7 +3863,7 @@ async fn responses(
     let tenant_id = request_context.tenant_id();
     let tenant_permit = match state.tenant_limiter.acquire(&tenant_id).await {
         Ok(permit) => permit,
-        Err(error) => return internal_error_response(error),
+        Err(error) => return provider_error_response(error),
     };
     let execution =
         match prepare_openai_responses_execution(&state.responses, request, &request_context).await
@@ -3894,51 +3947,60 @@ async fn responses(
         };
     }
 
-    match state.kernel.run(normalized).await {
-        Ok(output) => {
-            let context_report =
-                match finalize_context_report(&state.context, &prepared_context, &output).await {
-                    Ok(report) => report,
-                    Err(error) => return internal_error_response(error),
-                };
-            emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
-            if let Err(error) = state
-                .training_trace
-                .record_kernel(training_request.as_ref(), &output)
-            {
-                log_training_trace_error(error);
-            }
-            let conversation_messages = response_conversation_messages_from_kernel_output(
-                &execution,
-                execution.conversation_messages.clone(),
-                &output,
-            );
-            let mut response = format_openai_responses_response(
-                &execution,
-                &model,
-                output,
-                include_public_reasoning,
-            );
-            attach_context_report(&mut response, prepared_context.as_ref(), context_report);
-            if let Err(error) = maybe_store_openai_response(
-                &state.responses,
-                &execution,
-                &response,
-                conversation_messages,
-            )
-            .await
-            {
-                return internal_error_response(error);
-            }
-            if stream {
-                return response_with_tenant_permit(
-                    format_openai_responses_stream_response_from_value(response),
-                    tenant_permit,
+    let metrics = state.metrics.clone();
+    let response_future = async move {
+        match state.kernel.run(normalized).await {
+            Ok(output) => {
+                let context_report =
+                    match finalize_context_report(&state.context, &prepared_context, &output).await
+                    {
+                        Ok(report) => report,
+                        Err(error) => return internal_error_response(error),
+                    };
+                emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
+                if let Err(error) = state
+                    .training_trace
+                    .record_kernel(training_request.as_ref(), &output)
+                {
+                    log_training_trace_error(error);
+                }
+                let conversation_messages = response_conversation_messages_from_kernel_output(
+                    &execution,
+                    execution.conversation_messages.clone(),
+                    &output,
                 );
+                let mut response = format_openai_responses_response(
+                    &execution,
+                    &model,
+                    output,
+                    include_public_reasoning,
+                );
+                attach_context_report(&mut response, prepared_context.as_ref(), context_report);
+                if let Err(error) = maybe_store_openai_response(
+                    &state.responses,
+                    &execution,
+                    &response,
+                    conversation_messages,
+                )
+                .await
+                {
+                    return internal_error_response(error);
+                }
+                if stream {
+                    return response_with_tenant_permit(
+                        format_openai_responses_stream_response_from_value(response),
+                        tenant_permit,
+                    );
+                }
+                response_with_tenant_permit(Json(response).into_response(), tenant_permit)
             }
-            response_with_tenant_permit(Json(response).into_response(), tenant_permit)
+            Err(error) => kernel_error_response(error),
         }
-        Err(error) => kernel_error_response(error),
+    };
+    if stream {
+        orchestration_sse_response(response_future, metrics)
+    } else {
+        response_future.await
     }
 }
 
@@ -4908,7 +4970,7 @@ async fn messages(
     let tenant_id = request_context.tenant_id();
     let tenant_permit = match state.tenant_limiter.acquire(&tenant_id).await {
         Ok(permit) => permit,
-        Err(error) => return internal_error_response(error),
+        Err(error) => return provider_error_response(error),
     };
     let direct_training_request = state
         .training_trace
@@ -4981,33 +5043,47 @@ async fn messages(
         };
     }
 
-    match state.kernel.run(normalized).await {
-        Ok(output) => {
-            let context_report =
-                match finalize_context_report(&state.context, &prepared_context, &output).await {
-                    Ok(report) => report,
-                    Err(error) => return internal_error_response(error),
-                };
-            emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
-            if let Err(error) = state
-                .training_trace
-                .record_kernel(training_request.as_ref(), &output)
-            {
-                log_training_trace_error(error);
+    let metrics = state.metrics.clone();
+    let response_future = async move {
+        let _tenant_permit = tenant_permit;
+        match state.kernel.run(normalized).await {
+            Ok(output) => {
+                let context_report =
+                    match finalize_context_report(&state.context, &prepared_context, &output).await
+                    {
+                        Ok(report) => report,
+                        Err(error) => return internal_error_response(error),
+                    };
+                emit_kernel_telemetry(&telemetry_context, &output, context_report.as_ref());
+                if let Err(error) = state
+                    .training_trace
+                    .record_kernel(training_request.as_ref(), &output)
+                {
+                    log_training_trace_error(error);
+                }
+                if stream {
+                    return format_anthropic_stream_response(
+                        model,
+                        output,
+                        include_public_reasoning,
+                    );
+                }
+                let mut response = format_anthropic_response(
+                    model,
+                    output,
+                    include_encrypted_state,
+                    include_public_reasoning,
+                );
+                attach_context_report(&mut response, prepared_context.as_ref(), context_report);
+                Json(response).into_response()
             }
-            if stream {
-                return format_anthropic_stream_response(model, output, include_public_reasoning);
-            }
-            let mut response = format_anthropic_response(
-                model,
-                output,
-                include_encrypted_state,
-                include_public_reasoning,
-            );
-            attach_context_report(&mut response, prepared_context.as_ref(), context_report);
-            Json(response).into_response()
+            Err(error) => kernel_error_response(error),
         }
-        Err(error) => kernel_error_response(error),
+    };
+    if stream {
+        orchestration_sse_response(response_future, metrics)
+    } else {
+        response_future.await
     }
 }
 
@@ -5427,6 +5503,7 @@ fn kernel_error_response(error: KernelError) -> Response {
 }
 
 fn provider_error_response(error: ProviderError) -> Response {
+    let retry_after_ms = error.retry_after_ms();
     let (status, code, error_type) = match &error {
         ProviderError::Http { status, code, .. } => {
             let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -5469,7 +5546,7 @@ fn provider_error_response(error: ProviderError) -> Response {
             "server_error",
         ),
     };
-    (
+    let mut response = (
         status,
         Json(CompatibilityError {
             error: CompatibilityErrorBody {
@@ -5479,7 +5556,14 @@ fn provider_error_response(error: ProviderError) -> Response {
             },
         }),
     )
-        .into_response()
+        .into_response();
+    if let Some(retry_after_ms) = retry_after_ms {
+        let retry_after_seconds = retry_after_ms.saturating_add(999) / 1_000;
+        if let Ok(value) = header::HeaderValue::from_str(&retry_after_seconds.max(1).to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
 }
 
 fn internal_error_response(message: String) -> Response {
@@ -5549,6 +5633,7 @@ fn sse_response(body: String) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .body(Body::from(body))
         .unwrap_or_else(|error| internal_error_response(error.to_string()))
 }
@@ -5561,8 +5646,126 @@ where
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|error| internal_error_response(error.to_string()))
+}
+
+fn orchestration_stream_heartbeat_interval() -> Duration {
+    let seconds = std::env::var("MIYA_STREAM_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10);
+    Duration::from_secs(seconds)
+}
+
+fn orchestration_sse_response<F>(future: F, metrics: RuntimeMetrics) -> Response
+where
+    F: Future<Output = Response> + Send + 'static,
+{
+    orchestration_sse_response_with_interval(
+        future,
+        metrics,
+        orchestration_stream_heartbeat_interval(),
+    )
+}
+
+fn orchestration_sse_response_with_interval<F>(
+    future: F,
+    metrics: RuntimeMetrics,
+    heartbeat: Duration,
+) -> Response
+where
+    F: Future<Output = Response> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+    metrics
+        .orchestration_streams_active
+        .fetch_add(1, Ordering::Relaxed);
+    let task_metrics = metrics.clone();
+    tokio::spawn(async move {
+        let run = async {
+            if tx
+                .send(Ok(Bytes::from_static(b": miya orchestration active\n\n")))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let mut ticker = tokio::time::interval(heartbeat);
+            ticker.tick().await;
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    response = &mut future => {
+                        let status = response.status();
+                        let is_sse = response
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .is_some_and(|value| value.starts_with("text/event-stream"));
+                        let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                            Ok(body) => body,
+                            Err(error) => Bytes::from(
+                                sse_event(
+                                    "error",
+                                    serde_json::json!({
+                                        "type": "error",
+                                        "error": {
+                                            "type": "stream_body_error",
+                                            "message": error.to_string()
+                                        }
+                                    }),
+                                ),
+                            ),
+                        };
+                        let chunk = if status.is_success() && is_sse {
+                            body
+                        } else {
+                            let value = serde_json::from_slice::<serde_json::Value>(&body)
+                                .unwrap_or_else(|_| serde_json::json!({
+                                    "error": {
+                                        "type": "server_error",
+                                        "message": String::from_utf8_lossy(&body)
+                                    }
+                                }));
+                            Bytes::from(sse_event(
+                                "error",
+                                serde_json::json!({
+                                    "type": "error",
+                                    "error": value.get("error").cloned().unwrap_or(value)
+                                }),
+                            ))
+                        };
+                        let _ = tx.send(Ok(chunk)).await;
+                        return;
+                    }
+                    _ = ticker.tick() => {
+                        match tx.try_send(Ok(Bytes::from_static(b": miya orchestration active\n\n"))) {
+                            Ok(()) => {
+                                task_metrics
+                                    .orchestration_stream_heartbeats
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                }
+            }
+        };
+        run.await;
+        task_metrics
+            .orchestration_streams_active
+            .fetch_sub(1, Ordering::Relaxed);
+    });
+
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    sse_stream_response(stream)
 }
 
 fn sse_data(value: serde_json::Value) -> String {
@@ -11661,7 +11864,8 @@ mod tests {
 
     #[test]
     fn tenant_concurrency_limiter_defaults_to_medium_tier_when_unconfigured() {
-        let limiter = TenantConcurrencyLimiter::from_env_value(None);
+        let limiter =
+            TenantConcurrencyLimiter::from_env_values(None, DEFAULT_TENANT_QUEUE_TIMEOUT_MS);
 
         assert_eq!(
             limiter.max_per_tenant,
@@ -11671,6 +11875,33 @@ mod tests {
             DEFAULT_TENANT_MAX_CONCURRENT_REQUESTS,
             ReasoningEffort::Medium.max_agents() as usize
         );
+    }
+
+    #[tokio::test]
+    async fn tenant_concurrency_limiter_returns_bounded_overload_instead_of_waiting_forever() {
+        let limiter =
+            TenantConcurrencyLimiter::with_max_per_tenant_and_wait(1, Duration::from_millis(5));
+        let tenant = TenantId::from("slow-tenant");
+        let _first = limiter.acquire(&tenant).await.unwrap();
+
+        let error = limiter.acquire(&tenant).await.err().unwrap();
+
+        assert_eq!(error, ProviderError::QueueTimeout { wait_ms: 5 });
+    }
+
+    #[tokio::test]
+    async fn tenant_concurrency_limiter_prunes_inactive_tenant_semaphores() {
+        let limiter = TenantConcurrencyLimiter::with_max_per_tenant(1);
+        let first_tenant = TenantId::from("inactive-tenant");
+        let first = limiter.acquire(&first_tenant).await.unwrap();
+        drop(first);
+
+        let second_tenant = TenantId::from("active-tenant");
+        let _second = limiter.acquire(&second_tenant).await.unwrap();
+
+        let semaphores = limiter.semaphores.lock().unwrap();
+        assert_eq!(semaphores.len(), 1);
+        assert!(semaphores.contains_key("active-tenant"));
     }
 
     #[test]
@@ -12164,6 +12395,14 @@ mod tests {
             overloaded.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+
+        let provider_overloaded =
+            provider_error_response(ProviderError::QueueTimeout { wait_ms: 30_000 });
+        assert_eq!(
+            provider_overloaded.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(provider_overloaded.headers()[header::RETRY_AFTER], "30");
     }
 
     #[test]
@@ -13901,6 +14140,36 @@ mod tests {
         assert!(body.contains("event: message_start"));
         assert!(body.contains("direct backend response: direct anthropic stream"));
         assert_eq!(provider.max_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_sse_emits_heartbeats_while_a_slow_model_is_running() {
+        let metrics = RuntimeMetrics::default();
+        let response = orchestration_sse_response_with_interval(
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                sse_response("data: {\"done\":true}\n\n".to_string())
+            },
+            metrics.clone(),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        let body = response_text(response).await;
+        assert!(body.starts_with(": miya orchestration active\n\n"));
+        assert!(body.matches(": miya orchestration active").count() >= 2);
+        assert!(body.contains("data: {\"done\":true}"));
+        assert!(
+            metrics
+                .orchestration_stream_heartbeats
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+        assert_eq!(
+            metrics.orchestration_streams_active.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
